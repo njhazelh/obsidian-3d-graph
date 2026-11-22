@@ -136,12 +136,15 @@ export class MoteField {
 				if (sep > 0) {
 					// each stream gathers around its own anchor, on opposite
 					// sides of the link: angles narrow toward the anchor and
-					// the least-bowed lines move out, off the shared axis
+					// the least-bowed lines move out, off the shared axis;
 					const anchor = turn + (reverse ? Math.PI : 0);
 					const relative = Math.atan2(Math.sin(angle - anchor), Math.cos(angle - anchor));
 					// (square root: the streams stop overlapping from about halfway)
 					angle = anchor + relative * (1 - 0.8 * Math.sqrt(sep));
 					bow = bow + (1 - bow) * 0.35 * sep;
+					// and the streams loop further out, up to 2.5x the bow at 1,
+					// like two field loops on either side of the link
+					bow *= 1 + 1.5 * sep;
 				}
 				return {
 					angle,
