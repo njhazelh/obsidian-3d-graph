@@ -1,4 +1,5 @@
-import { ButtonComponent, ExtraButtonComponent, TextComponent } from "obsidian";
+import { ButtonComponent, ExtraButtonComponent, Setting, TextComponent } from "obsidian";
+import SimpleSliderSetting from "src/views/atomics/SimpleSliderSetting";
 import {
 	GroupSettings,
 	NodeGroup,
@@ -12,19 +13,60 @@ const GroupSettingsView = (
 	containerEl: HTMLElement,
 	theme: ObsidianTheme
 ) => {
-	NodeGroups(groupSettings, containerEl);
-	AddNodeGroupButton(groupSettings, containerEl, theme);
+	ClusterSettings(groupSettings, containerEl.createDiv());
+	const groupsEl = containerEl.createDiv();
+	const render = () => {
+		groupsEl.empty();
+		NodeGroups(groupSettings, groupsEl);
+		AddNodeGroupButton(groupSettings, groupsEl, theme, render);
+	};
+	render();
 
 	groupSettings.onChange((change: StateChange) => {
+		const path = change.currentPath ?? "";
 		if (
-			(change.currentPath === "groups" && change.type === "add") ||
-			change.type === "delete"
-		) {
-			containerEl.empty();
-			NodeGroups(groupSettings, containerEl);
-			AddNodeGroupButton(groupSettings, containerEl, theme);
-		}
+			path.startsWith("groups") &&
+			(change.type === "add" || change.type === "delete")
+		)
+			render();
 	});
+};
+
+// Automatic coloring by detected cluster
+const ClusterSettings = (groupSettings: State<GroupSettings>, containerEl: HTMLElement) => {
+	new Setting(containerEl)
+		.setName("Color by cluster")
+		.addToggle((toggle) =>
+			toggle.setValue(groupSettings.value.colorByCluster).onChange((value) => {
+				groupSettings.value.colorByCluster = value;
+			})
+		)
+		.nameEl.setAttr(
+			"aria-label",
+			"Detects groups of closely linked notes and gives each a color"
+		);
+	SimpleSliderSetting(
+		containerEl,
+		{
+			name: "Group count",
+			value: groupSettings.value.clusterCount,
+			stepOptions: { min: 2, max: 12, step: 1 },
+		},
+		(value) => {
+			groupSettings.value.clusterCount = value;
+		}
+	);
+	SimpleSliderSetting(
+		containerEl,
+		{
+			name: "Cluster pull",
+			value: groupSettings.value.clusterPull,
+			stepOptions: { min: 0, max: 1, step: 0.05 },
+		},
+		(value) => {
+			groupSettings.value.clusterPull = value;
+		}
+	);
 };
 
 const NodeGroups = (
@@ -49,7 +91,8 @@ const NodeGroups = (
 const AddNodeGroupButton = (
 	groupSettings: State<GroupSettings>,
 	containerEl: HTMLElement,
-	theme: ObsidianTheme
+	theme: ObsidianTheme,
+	rerender: () => void
 ) => {
 	containerEl.querySelector(".graph-color-button-container")?.remove();
 
@@ -60,9 +103,10 @@ const AddNodeGroupButton = (
 		.setClass("mod-cta")
 		.setButtonText("Add Group")
 		.onClick(() => {
-			groupSettings.value.groups.push(new NodeGroup("", theme.textMuted));
-			containerEl.empty();
-			GroupSettingsView(groupSettings, containerEl, theme);
+			groupSettings.value.groups.push(
+				new NodeGroup("", ObsidianTheme.toHex(theme.textAccent))
+			);
+			rerender();
 		});
 };
 const GroupSettingItem = (

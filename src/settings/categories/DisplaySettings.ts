@@ -1,36 +1,36 @@
-export class DisplaySettings {
-	nodeSize = 4;
-	linkThickness = 5;
-	particleSize = 6;
-	particleCount = 4;
+export type LinkStyle = "lines" | "particles" | "both";
 
-	constructor(
-		nodeSize?: number,
-		linkThickness?: number,
-		particleSize?: number,
-		particleCount?: number
-	) {
-		this.nodeSize = nodeSize ?? this.nodeSize;
-		this.linkThickness = linkThickness ?? this.linkThickness;
-		this.particleSize = particleSize ?? this.particleSize;
-		this.particleCount = particleCount ?? this.particleCount;
+export class DisplaySettings {
+	nodeSize = 3;
+	linkThickness = 2;
+	particleSize = 2;
+	particleCount = 2; // unused since motes; kept so old settings load
+	// motes of light flowing along each link, each on its own arc
+	motesPerLink = 12;
+	showLabels = true;
+	// lines, particles flowing along each link, or both
+	linkStyle: LinkStyle = "lines";
+	// how far motes' arcs spread around the link (0 = all on the line)
+	particleArc = 0.35;
+	particleSpeed = 4;
+	showArrows = false;
+	// like the 2D graph: labels fade out as you zoom away; higher = visible from further
+	textFade = 0;
+
+	constructor(init?: Partial<DisplaySettings>) {
+		Object.entries(init ?? {}).forEach(([key, value]) => {
+			if (value !== undefined && key in this)
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(this as any)[key] = value;
+		});
 	}
 
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	public static fromStore(store: any) {
-		return new DisplaySettings(
-			store?.nodeSize,
-			store?.linkThickness,
-			store?.particleSize,
-			store?.particleCount
-		);
+		return new DisplaySettings(store ?? {});
 	}
 
 	public toObject() {
-		return {
-			nodeSize: this.nodeSize,
-			linkThickness: this.linkThickness,
-			particleSize: this.particleSize,
-			particleCount: this.particleCount,
-		};
+		return { ...this };
 	}
 }

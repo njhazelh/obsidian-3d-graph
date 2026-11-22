@@ -1,15 +1,29 @@
-import { Notice, Plugin } from "obsidian";
+import { Notice, Plugin, debounce } from "obsidian";
 import { Graph3dView } from "./views/graph/Graph3dView";
 import GraphSettings from "./settings/GraphSettings";
 import State from "./util/State";
 import Graph from "./graph/Graph";
 import ObsidianTheme from "./util/ObsidianTheme";
 import EventBus from "./util/EventBus";
-import { ResolvedLinkCache } from "./graph/Link";
-import shallowCompare from "./util/ShallowCompare";
+import { CoreGraphOptions, readCoreGraphOptions } from "./util/CoreGraphOptions";
+import { brokenLinkKey } from "./settings/categories/FilterSettings";
 
 export default class Graph3dPlugin extends Plugin {
-	_resolvedCache: ResolvedLinkCache;
+	// filters, groups and forces of Obsidian's 2D graph, kept in sync
+	public coreGraphOptions: CoreGraphOptions = {
+		search: "",
+		showTags: false,
+		showAttachments: false,
+		hideUnresolved: false,
+		showOrphans: true,
+		colorGroups: [],
+		showArrow: false,
+		centerStrength: 0.5,
+		repelStrength: 10,
+		linkStrength: 1,
+		linkDistance: 250,
+	};
+	private globalGraphSignature = "";
 
 	// States
 	public settingsState: State<GraphSettings>;
@@ -27,6 +41,12 @@ export default class Graph3dPlugin extends Plugin {
 
 	async onload() {
 		await this.init();
+		// lets Page Preview show notes when hovering nodes with Cmd/Ctrl held
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(this as any).registerHoverLinkSource?.("3d-graph", {
+			display: "3D Graph",
+			defaultMod: true,
+		});
 		this.addRibbonIcon("glasses", "3D Graph", this.openGlobalGraph);
 		this.addCommand({
 			id: "open-3d-graph-global",
@@ -50,9 +70,10 @@ export default class Graph3dPlugin extends Plugin {
 		const settings = await this.loadSettings();
 		this.settingsState = new State<GraphSettings>(settings);
 		this.theme = new ObsidianTheme(this.app.workspace.containerEl);
+		this.coreGraphOptions = await readCoreGraphOptions(this.app);
 		this.cacheIsReady.value =
 			this.app.metadataCache.resolvedLinks !== undefined;
-		this.onGraphCacheChanged();
+		this.rebuildGlobalGraph();
 	}
 
 	private initListeners() {
@@ -76,6 +97,14 @@ export default class Graph3dPlugin extends Plugin {
 			})
 		);
 
+		// re-read theme colors when the theme or accent color changes
+		this.registerEvent(
+			this.app.workspace.on("css-change", () => {
+				this.theme = new ObsidianTheme(this.app.workspace.containerEl);
+				EventBus.trigger("theme-changed");
+			})
+		);
+
 		// when a file gets opened, update the open file state
 		this.registerEvent(
 			this.app.workspace.on("file-open", (file) => {
@@ -92,15 +121,25 @@ export default class Graph3dPlugin extends Plugin {
 			})
 		);
 
-		// all files are resolved, so the cache is ready:
-		this.app.metadataCache.on(
-			"resolved",
-			this.onGraphCacheReady.bind(this)
+		// all files are resolved (after startup and after every change):
+		// rebuild the graph, which also picks up tag and file changes
+		this.registerEvent(
+			this.app.metadataCache.on("resolved", this.onGraphCacheReady)
 		);
-		// the cache changed:
-		this.app.metadataCache.on(
-			"resolve",
-			this.onGraphCacheChanged.bind(this)
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				this.renameHidden(oldPath, file.path);
+				this.requestRebuild();
+			})
+		);
+		this.registerEvent(this.app.vault.on("delete", this.requestRebuild));
+
+		// pick up changes made in the 2D graph's controls
+		this.registerEvent(
+			this.app.workspace.on("active-leaf-change", this.refreshCoreGraphOptions)
+		);
+		this.registerEvent(
+			this.app.workspace.on("layout-change", this.refreshCoreGraphOptions)
 		);
 	}
 
@@ -111,37 +150,44 @@ export default class Graph3dPlugin extends Plugin {
 	}
 
 	private onGraphCacheReady = () => {
-		console.log("Graph cache is ready");
 		this.cacheIsReady.value = true;
-		this.onGraphCacheChanged();
+		this.requestRebuild();
 	};
 
-	private onGraphCacheChanged = () => {
-		// check if the cache actually updated
-		// Obsidian API sends a lot of (for this plugin) unnecessary stuff
-		// with the resolve event
-		if (
-			this.cacheIsReady.value &&
-			!shallowCompare(
-				this._resolvedCache,
-				this.app.metadataCache.resolvedLinks
-			)
-		) {
-			this._resolvedCache = structuredClone(
-				this.app.metadataCache.resolvedLinks
+	private requestRebuild = debounce(() => this.rebuildGlobalGraph(), 300, true);
+
+	// Rebuilds the vault graph and tells open views, if anything changed
+	private rebuildGlobalGraph() {
+		if (!this.cacheIsReady.value) return;
+		const graph = Graph.createFromApp(this.app);
+		const signature = graph.signature();
+		if (signature === this.globalGraphSignature) return;
+		this.globalGraphSignature = signature;
+		this.globalGraph = graph;
+		EventBus.trigger("graph-changed");
+	}
+
+	// keeps hidden nodes and broken links attached to a renamed file
+	private renameHidden(oldPath: string, newPath: string) {
+		const filters = this.settingsState.value.filters;
+		const i = filters.hiddenNodes.indexOf(oldPath);
+		if (i !== -1) filters.hiddenNodes.splice(i, 1, newPath);
+		filters.brokenLinks.forEach((key, j) => {
+			const ends = key.split("|");
+			if (!ends.includes(oldPath)) return;
+			filters.brokenLinks.splice(
+				j,
+				1,
+				brokenLinkKey(...(ends.map((e) => (e === oldPath ? newPath : e)) as [string, string]))
 			);
-			this.globalGraph = Graph.createFromApp(this.app);
-		} else {
-			console.log(
-				"changed but ",
-				this.cacheIsReady.value,
-				" and ",
-				shallowCompare(
-					this._resolvedCache,
-					this.app.metadataCache.resolvedLinks
-				)
-			);
-		}
+		});
+	}
+
+	private refreshCoreGraphOptions = async () => {
+		const next = await readCoreGraphOptions(this.app);
+		if (JSON.stringify(next) === JSON.stringify(this.coreGraphOptions)) return;
+		this.coreGraphOptions = next;
+		EventBus.trigger("core-graph-options-changed");
 	};
 
 	private onDoResetSettings = () => {
@@ -168,6 +214,7 @@ export default class Graph3dPlugin extends Plugin {
 
 	// Open a global or local graph
 	private openGraph = (isLocalGraph: boolean) => {
+		this.refreshCoreGraphOptions();
 		const leaf = this.app.workspace.getLeaf(isLocalGraph ? "split" : false);
 		const graphView = new Graph3dView(this, leaf, isLocalGraph);
 		leaf.open(graphView);
@@ -185,10 +232,6 @@ export default class Graph3dPlugin extends Plugin {
 	}
 
 	async saveSettings() {
-		console.log(
-			"saveSettings:",
-			this.settingsState.getRawValue().toObject()
-		);
 		await this.saveData(this.settingsState.getRawValue().toObject());
 	}
 

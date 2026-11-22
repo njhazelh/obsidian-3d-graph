@@ -55,3 +55,118 @@
 	display: none;
 	visibility: hidden;
 }
+
+/* own filters are inactive while "Match 2D graph" is on */
+.graph-3d-view .setting-item.is-disabled {
+	opacity: 0.5;
+	pointer-events: none;
+}
+
+.graph-3d-view .graph-control-animate {
+	padding: 8px 0 4px;
+}
+
+.graph-3d-view .graph-control-animate button {
+	width: 100%;
+}
+
+/* cluster legend: bottom-left, hover to highlight, click to zoom */
+.graph-3d-view .graph-3d-cluster-legend {
+	position: absolute;
+	left: 12px;
+	bottom: 12px;
+	max-width: 240px;
+	padding: 6px;
+	border-radius: var(--radius-m, 8px);
+	background: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	box-shadow: var(--shadow-s);
+	font-size: var(--font-ui-smaller, 12px);
+	z-index: 2;
+}
+
+.graph-3d-view .graph-3d-cluster-legend.is-hidden {
+	display: none;
+}
+
+.graph-3d-view .graph-3d-cluster-item {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 3px 6px;
+	border-radius: var(--radius-s, 4px);
+	cursor: pointer;
+	color: var(--text-muted);
+}
+
+.graph-3d-view .graph-3d-cluster-item:hover {
+	background: var(--background-modifier-hover);
+	color: var(--text-normal);
+}
+
+.graph-3d-view .graph-3d-cluster-dot {
+	flex: none;
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+}
+
+.graph-3d-view .graph-3d-cluster-name {
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.graph-3d-view .graph-3d-cluster-count {
+	color: var(--text-faint);
+	font-variant-numeric: tabular-nums;
+}
+
+.graph-3d-view .graph-3d-cluster-more {
+	padding: 3px 6px;
+	color: var(--text-faint);
+}
+
+/* full-width search field, like the core graph's */
+.graph-3d-view .setting-item.mod-search-setting .setting-item-control,
+.graph-3d-view .setting-item.mod-search-setting .search-input-container {
+	width: 100%;
+}
+
+/* nodes hidden / links broken in the 3D graph, restorable */
+.graph-3d-view .graph-3d-hidden-list:not(:empty) {
+	margin-top: var(--size-4-2);
+	padding-top: var(--size-4-2);
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.graph-3d-view .graph-3d-hidden-title {
+	margin-bottom: var(--size-4-1);
+}
+
+.graph-3d-view .graph-3d-hidden-item {
+	display: flex;
+	align-items: center;
+	gap: var(--size-4-2);
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+}
+
+.graph-3d-view .graph-3d-hidden-icon {
+	width: 1em;
+	text-align: center;
+	color: var(--text-faint);
+}
+
+.graph-3d-view .graph-3d-hidden-name {
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.graph-3d-view .graph-3d-hidden-restore button {
+	width: 100%;
+	margin-top: var(--size-4-2);
+}
