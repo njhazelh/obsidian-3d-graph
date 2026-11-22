@@ -1,4 +1,5 @@
 import ForceGraph3D, { ForceGraph3DInstance } from "3d-force-graph";
+import { Notice } from "obsidian";
 import * as THREE from "three";
 import { forceX, forceY, forceZ } from "d3-force-3d";
 import Node from "../../graph/Node";
@@ -9,7 +10,7 @@ import Graph from "../../graph/Graph";
 import { NodeGroup } from "../../settings/categories/GroupSettings";
 import EventBus from "../../util/EventBus";
 import ObsidianTheme from "../../util/ObsidianTheme";
-import { compileQuery, isEmptyQuery, Matcher } from "../../graph/Search";
+import { compileQuery, isEmptyQuery, Matcher, unsupportedSyntax } from "../../graph/Search";
 import { clusterColor, clusterInto } from "../../graph/Clusters";
 import { brokenLinkKey } from "../../settings/categories/FilterSettings";
 import { MoteField, MoteStyle } from "./MoteField";
@@ -28,6 +29,19 @@ interface Cluster {
 // Adapted from https://github.com/vasturiano/3d-force-graph/blob/master/example/highlight/index.html
 
 // D3 replaces link source/target ids with the node objects once rendered
+// Appends to the list stored under a key, creating it if needed
+const pushTo = <K, V>(map: Map<K, V[]>, key: K, value: V) => {
+	const list = map.get(key);
+	if (list) list.push(value);
+	else map.set(key, [value]);
+};
+
+// Tags on more notes than this join their notes through one shared hub
+// instead of an edge for every pair, which would grow with the square
+const TAG_PAIR_LIMIT = 30;
+
+const WARMUP_TICKS = 120;
+
 const endpointId = (end: string | Node): string =>
 	typeof end === "string" ? end : end.id;
 
@@ -60,6 +74,8 @@ export class ForceGraph {
 	private readonly visibleDegree = new Map<string, number>();
 	private colorGroups: { matches: Matcher; color: string }[] = [];
 	private clusters: Cluster[] = [];
+	private warnedQuery: string | null = null;
+	private clusterCache: { key: string; community: Map<string, number> } | null = null;
 	private readonly clusterColorOf = new Map<string, string>();
 	private readonly clusterIndexOf = new Map<string, number>();
 	private legendEl: HTMLElement | undefined;
@@ -163,7 +179,7 @@ export class ForceGraph {
 			.width(this.rootHtmlElement.offsetWidth || window.innerWidth)
 			.height(this.rootHtmlElement.offsetHeight || window.innerHeight)
 			// settle most of the layout before the first frame, then frame it
-			.warmupTicks(120)
+			.warmupTicks(WARMUP_TICKS)
 			.cooldownTime(2500)
 			.onEngineTick(this.updateLabelFade)
 			.onEngineStop(this.frameGraph)
@@ -274,17 +290,19 @@ export class ForceGraph {
 		const local = this.settings.local;
 		const nodeById = new Map(graph.nodes.map((n) => [n.id, n] as [string, Node]));
 		const edges = new Map<string, { other: string; outgoing: boolean }[]>();
-		const addEdge = (from: string, other: string, outgoing: boolean) => {
-			const list = edges.get(from) ?? [];
-			list.push({ other, outgoing });
-			edges.set(from, list);
-		};
+		const addEdge = (from: string, other: string, outgoing: boolean) =>
+			pushTo(edges, from, { other, outgoing });
 		const { hidden, broken } = this.removed();
 		graph.links.forEach((link) => {
 			const [s, t] = [endpointId(link.source), endpointId(link.target)];
 			if (broken.has(brokenLinkKey(s, t))) return;
 			addEdge(s, t, true);
 			addEdge(t, s, false);
+			// a link both ways counts as outgoing and incoming for both notes
+			if (link.mutual) {
+				addEdge(s, t, false);
+				addEdge(t, s, true);
+			}
 		});
 
 		const level = new Map<string, number>([[rootId, 0]]);
@@ -339,12 +357,30 @@ export class ForceGraph {
 		if (!broken.includes(key)) broken.push(key);
 	}
 
+	// The search as a matcher, or null to show everything. A query using
+	// syntax the 3D graph can't evaluate (e.g. content: or [property]) is
+	// ignored rather than guessed at, which could empty the graph.
+	private compileSearch(query: string): Matcher | null {
+		if (isEmptyQuery(query)) return null;
+		const unsupported = unsupportedSyntax(query);
+		if (unsupported) {
+			if (this.warnedQuery !== query) {
+				this.warnedQuery = query;
+				new Notice(
+					`3D graph: the search uses "${unsupported}", which the 3D graph can't filter by, so all notes are shown.`
+				);
+			}
+			return null;
+		}
+		return compileQuery(query);
+	}
+
 	// Applies the filters to fullGraph, like the core graph does:
 	// the search picks files, tags and missing notes come along with the files
 	// that reference them, and orphans are judged on what remains.
 	private filterGraph(): Graph {
 		const f = this.filters;
-		const search = isEmptyQuery(f.search) ? null : compileQuery(f.search);
+		const search = this.compileSearch(f.search);
 		const root = this.isLocalGraph ? this.plugin.openFileState.value : undefined;
 
 		const { hidden, broken } = this.removed();
@@ -424,27 +460,44 @@ export class ForceGraph {
 				if (fileIds.has(s) && fileIds.has(t)) edges.push([s, t, 1]);
 			});
 			const notesByTag = new Map<string, string[]>();
-			files.forEach((n) =>
-				n.tags.forEach((tag) =>
-					notesByTag.set(tag, [...(notesByTag.get(tag) ?? []), n.id])
-				)
-			);
-			notesByTag.forEach((ids) => {
+			files.forEach((n) => n.tags.forEach((tag) => pushTo(notesByTag, tag, n.id)));
+			const hubs: string[] = [];
+			notesByTag.forEach((ids, tag) => {
 				if (ids.length < 2) return;
-				const w = 1 / (ids.length - 1);
-				for (let i = 0; i < ids.length; i++)
-					for (let j = i + 1; j < ids.length; j++) edges.push([ids[i], ids[j], w]);
+				if (ids.length <= TAG_PAIR_LIMIT) {
+					const w = 1 / (ids.length - 1);
+					for (let i = 0; i < ids.length; i++)
+						for (let j = i + 1; j < ids.length; j++) edges.push([ids[i], ids[j], w]);
+				} else {
+					// a common tag: each of its notes links to one hub, with the
+					// same total weight per note as the pairs would give
+					const hub = `\u0000tag-hub:${tag}`;
+					hubs.push(hub);
+					ids.forEach((id) => edges.push([id, hub, 1]));
+				}
 			});
 
-			const community = clusterInto([...fileIds].sort(), edges, groups.clusterCount);
+			// clustering only depends on the notes, their edges and the count,
+			// so a search or setting that leaves those alone reuses the last result
+			const nodeIds = [...fileIds].sort().concat(hubs.sort());
+			const key =
+				`${groups.clusterCount}\n${nodeIds.join("\n")}\n` +
+				edges.map(([a, b, w]) => `${a}\u0001${b}\u0001${w}`).join("\n");
+			let community: Map<string, number>;
+			if (this.clusterCache?.key === key) community = this.clusterCache.community;
+			else {
+				community = clusterInto(nodeIds, edges, groups.clusterCount);
+				hubs.forEach((h) => community.delete(h));
+				this.clusterCache = { key, community };
+			}
 
 			// tags and missing notes join their neighbors' most common cluster
 			const assignment = new Map(community);
 			const neighborsOf = new Map<string, string[]>();
 			this.graph.links.forEach((l) => {
 				const [s, t] = [endpointId(l.source), endpointId(l.target)];
-				neighborsOf.set(s, [...(neighborsOf.get(s) ?? []), t]);
-				neighborsOf.set(t, [...(neighborsOf.get(t) ?? []), s]);
+				pushTo(neighborsOf, s, t);
+				pushTo(neighborsOf, t, s);
 			});
 			this.graph.nodes.forEach((n) => {
 				if (fileIds.has(n.id)) return;
@@ -465,7 +518,7 @@ export class ForceGraph {
 			this.graph.nodes.forEach((node) => {
 				const c = assignment.get(node.id);
 				if (c === undefined) return;
-				byCommunity.set(c, [...(byCommunity.get(c) ?? []), node]);
+				pushTo(byCommunity, c, node);
 			});
 			const noteCount = (members: Node[]) =>
 				members.filter((n) => fileIds.has(n.id)).length;
@@ -714,6 +767,9 @@ export class ForceGraph {
 		this.clearHighlights();
 		this.hoveredNode = null;
 
+		// each step adds nodes to the live layout; re-running the warm-up
+		// on every step would block the UI
+		this.instance.warmupTicks(0);
 		let count = 0;
 		const step = () => {
 			count = Math.min(files.length, count + perStep);
@@ -736,7 +792,10 @@ export class ForceGraph {
 			this.resetMotes();
 			if (count < files.length)
 				this.animationTimer = window.setTimeout(step, 60);
-			else this.rebuildLabels();
+			else {
+				this.instance.warmupTicks(WARMUP_TICKS);
+				this.rebuildLabels();
+			}
 		};
 		step();
 	}
@@ -882,7 +941,8 @@ export class ForceGraph {
 	// A text sprite under each node, drawn with the theme's font and colors
 	private createLabel = (node: Node): THREE.Object3D => {
 		const group = new THREE.Group();
-		if (!this.display.showLabels && !this.hoveredNode) return group;
+		// with labels off, only the hovered neighborhood gets labels
+		if (!this.display.showLabels && !this.highlightedNodes.has(node.id)) return group;
 
 		const theme = this.theme;
 		const text = displayName(node);
@@ -1009,9 +1069,7 @@ export class ForceGraph {
 				this.highlightedNodes.add(endpointId(link.target));
 			});
 		}
-		const labelsNeedBuilding =
-			!this.display.showLabels &&
-			(this.hoveredNode === null) !== (node === null);
+		const labelsNeedBuilding = !this.display.showLabels && this.hoveredNode !== (node ?? null);
 		this.hoveredNode = node ?? null;
 		if (labelsNeedBuilding) this.rebuildLabels();
 		this.updateHighlight();
@@ -1045,7 +1103,7 @@ export class ForceGraph {
 			const s = node(link.source);
 			const t = node(link.target);
 			const fallback = this.theme.textMuted;
-			return [s ? this.baseColor(s) : fallback, t ? this.baseColor(t) : fallback];
+			return [s ? this.moteColor(s) : fallback, t ? this.moteColor(t) : fallback];
 		},
 		brightness: (link: Link) => {
 			const highlighted = this.isHighlightedLink(link);
@@ -1060,7 +1118,20 @@ export class ForceGraph {
 		additive: true,
 	};
 
+	// node colors for motes, asked for every frame, so cached until the
+	// graph, settings, theme or highlight change
+	private readonly moteColors = new Map<string, string>();
+	private moteColor(node: Node): string {
+		let color = this.moteColors.get(node.id);
+		if (color === undefined) {
+			color = this.baseColor(node);
+			this.moteColors.set(node.id, color);
+		}
+		return color;
+	}
+
 	private refreshMoteStyle() {
+		this.moteColors.clear();
 		this.moteStyle.size = this.display.particleSize * 4.5;
 		this.moteStyle.speed = this.display.particleSpeed * 0.06;
 		this.moteStyle.spread = this.display.particleArc;
@@ -1074,7 +1145,10 @@ export class ForceGraph {
 		const frame = (now: number) => {
 			const dt = this.lastFrameTime ? Math.min(0.05, (now - this.lastFrameTime) / 1000) : 0;
 			this.lastFrameTime = now;
-			this.motes?.update(dt, this.moteStyle, this.rootHtmlElement.offsetHeight || 600);
+			// nothing to draw while the view is in a background tab or minimized
+			const shown = !document.hidden && this.rootHtmlElement.offsetParent !== null;
+			if (shown)
+				this.motes?.update(dt, this.moteStyle, this.rootHtmlElement.offsetHeight || 600);
 			this.moteFrame = window.requestAnimationFrame(frame);
 		};
 		this.moteFrame = window.requestAnimationFrame(frame);
@@ -1157,6 +1231,7 @@ export class ForceGraph {
 	};
 
 	private updateHighlight() {
+		this.moteColors.clear();
 		this.labels.forEach((sprite, id) => this.applyLabelHighlight(id, sprite));
 		// re-setting the accessors makes three-forcegraph re-evaluate them
 		this.instance

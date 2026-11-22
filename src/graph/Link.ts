@@ -4,6 +4,9 @@ export default class Link {
 	public readonly source: string;
 	public readonly target: string;
 	public readonly linksAnAttachment: boolean;
+	// true when the target also links back to the source; the two notes then
+	// share this one link
+	public mutual = false;
 
 	constructor(sourceId: string, targetId: string, linksAnAttachment: boolean) {
 		this.source = sourceId;

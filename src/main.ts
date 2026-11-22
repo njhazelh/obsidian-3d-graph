@@ -150,8 +150,14 @@ export default class Graph3dPlugin extends Plugin {
 	}
 
 	private onGraphCacheReady = () => {
+		if (this.cacheIsReady.value) {
+			this.requestRebuild();
+			return;
+		}
+		// build the graph before views queued while loading open (setting
+		// cacheIsReady opens them right away; a debounced build would be late)
+		this.buildGlobalGraph();
 		this.cacheIsReady.value = true;
-		this.requestRebuild();
 	};
 
 	private requestRebuild = debounce(() => this.rebuildGlobalGraph(), 300, true);
@@ -159,12 +165,17 @@ export default class Graph3dPlugin extends Plugin {
 	// Rebuilds the vault graph and tells open views, if anything changed
 	private rebuildGlobalGraph() {
 		if (!this.cacheIsReady.value) return;
+		if (this.buildGlobalGraph()) EventBus.trigger("graph-changed");
+	}
+
+	// Builds the vault graph; returns whether it changed
+	private buildGlobalGraph(): boolean {
 		const graph = Graph.createFromApp(this.app);
 		const signature = graph.signature();
-		if (signature === this.globalGraphSignature) return;
+		if (signature === this.globalGraphSignature) return false;
 		this.globalGraphSignature = signature;
 		this.globalGraph = graph;
-		EventBus.trigger("graph-changed");
+		return true;
 	}
 
 	// keeps hidden nodes and broken links attached to a renamed file

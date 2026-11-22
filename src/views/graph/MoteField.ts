@@ -91,6 +91,7 @@ export class MoteField {
 	private motes: Mote[] = [];
 	private capacity = 0;
 	private time = 0;
+	private cleared = false; // every mote was hidden on the last frame
 	private readonly colorCache = new Map<string, THREE.Color>();
 
 	constructor(scene: THREE.Object3D) {
@@ -139,6 +140,7 @@ export class MoteField {
 				});
 			}
 		});
+		this.cleared = false;
 		this.ensureCapacity(this.motes.length, style);
 		this.geometry?.setDrawRange(0, this.motes.length);
 	}
@@ -198,8 +200,12 @@ export class MoteField {
 		const alpha = this.geometry.attributes.aAlpha.array as Float32Array;
 		const size = this.geometry.attributes.aSize.array as Float32Array;
 
-		// per-link geometry and colors, computed once per frame
+		// per-link geometry and colors, computed once per frame; links with
+		// no visible motes (e.g. lines mode with nothing hovered) are skipped
+		let anyVisible = false;
 		const frames = this.links.map((link) => {
+			const bright = style.brightness(link);
+			if (bright <= 0) return null;
 			const s = link.source as Endpoint;
 			const t = link.target as Endpoint;
 			if (typeof s === "string" || typeof t === "string" || s.x === undefined || t.x === undefined)
@@ -216,8 +222,12 @@ export class MoteField {
 			v = [v[0] / vl, v[1] / vl, v[2] / vl];
 			const w = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
 			const [from, to] = style.colors(link);
-			return { a, b, len, v, w, from: this.color(from), to: this.color(to), bright: style.brightness(link) };
+			anyVisible = true;
+			return { a, b, len, v, w, from: this.color(from), to: this.color(to), bright };
 		});
+		// all hidden, and already cleared last frame: nothing to upload
+		if (!anyVisible && this.cleared) return;
+		this.cleared = !anyVisible;
 
 		this.motes.forEach((m, i) => {
 			const f = frames[m.link];

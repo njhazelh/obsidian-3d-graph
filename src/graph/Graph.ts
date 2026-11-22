@@ -91,7 +91,7 @@ export default class Graph {
 	public static createFromApp = (app: App): Graph => {
 		const [nodes, nodeIndex] = Node.createFromFiles(app, app.vault.getFiles());
 		const links: Link[] = [];
-		const seen = new Set<string>();
+		const seen = new Map<string, Link>();
 
 		const getOrAddNode = (id: string, create: () => Node): Node => {
 			const index = nodeIndex.get(id);
@@ -105,10 +105,17 @@ export default class Graph {
 			if (source === target) return;
 			const key = `${source.id}\u0000${target.id}`;
 			const reverse = `${target.id}\u0000${source.id}`;
-			if (seen.has(key) || seen.has(reverse)) return;
-			seen.add(key);
+			if (seen.has(key)) return;
+			const existing = seen.get(reverse);
+			if (existing) {
+				existing.mutual = true;
+				return;
+			}
 			const link = source.addNeighbor(target);
-			if (link) links.push(link);
+			if (link) {
+				seen.set(key, link);
+				links.push(link);
+			}
 		};
 
 		const { resolvedLinks, unresolvedLinks } = app.metadataCache;
@@ -156,7 +163,7 @@ export default class Graph {
 		return (
 			this.nodes.map((n) => n.id).join("\n") +
 			"\n--\n" +
-			this.links.map((l) => `${l.source}>${l.target}`).join("\n")
+			this.links.map((l) => `${l.source}${l.mutual ? "<>" : ">"}${l.target}`).join("\n")
 		);
 	}
 }

@@ -101,15 +101,13 @@ const HiddenList = (filterSettings: State<FilterSettings>, containerEl: HTMLElem
 		};
 		hiddenNodes.forEach((id) =>
 			row(nameOf(id), "◌", () => {
-				const list = filterSettings.value.hiddenNodes;
-				list.splice(list.indexOf(id), 1);
+				removeFrom(filterSettings.value.hiddenNodes, id);
 			})
 		);
 		brokenLinks.forEach((key) => {
 			const [a, b] = key.split("|");
 			row(`${nameOf(a)} ↔ ${nameOf(b)}`, "⤫", () => {
-				const list = filterSettings.value.brokenLinks;
-				list.splice(list.indexOf(key), 1);
+				removeFrom(filterSettings.value.brokenLinks, key);
 			});
 		});
 		new ButtonComponent(containerEl.createDiv({ cls: "graph-3d-hidden-restore" }))
@@ -120,10 +118,18 @@ const HiddenList = (filterSettings: State<FilterSettings>, containerEl: HTMLElem
 			});
 	};
 	render();
-	filterSettings.onChange((change) => {
+	// returns the unsubscribe, so the settings view can drop it when rebuilt
+	return filterSettings.onChange((change) => {
 		const path = change.currentPath ?? "";
 		if (path.startsWith("hiddenNodes") || path.startsWith("brokenLinks")) render();
 	});
+};
+
+// Removes a value from a list, if it is still there (another view may have
+// removed it already; splice(-1) would drop the last entry instead)
+const removeFrom = (list: string[], value: string) => {
+	const index = list.indexOf(value);
+	if (index !== -1) list.splice(index, 1);
 };
 
 export default FilterSettingsView;

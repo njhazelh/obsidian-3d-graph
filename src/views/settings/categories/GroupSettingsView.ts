@@ -22,7 +22,7 @@ const GroupSettingsView = (
 	};
 	render();
 
-	groupSettings.onChange((change: StateChange) => {
+	return groupSettings.onChange((change: StateChange) => {
 		const path = change.currentPath ?? "";
 		if (
 			path.startsWith("groups") &&

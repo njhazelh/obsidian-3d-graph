@@ -146,13 +146,17 @@ export class GraphSettingsView extends HTMLDivElement {
 	private appendSetting<S>(
 		setting: S,
 		title: string,
-		view: (setting: S, containerEl: HTMLElement) => void
+		// may return a cleanup (e.g. an unsubscribe) to run when the view is rebuilt
+		view: (setting: S, containerEl: HTMLElement) => void | (() => void)
 	) {
 		const header = document.createElement("header");
 		header.classList.add("graph-control-section-header");
 		header.textContent = title;
 		const item = new TreeItem(header, [
-			(containerEl: HTMLElement) => view(setting, containerEl),
+			(containerEl: HTMLElement) => {
+				const cleanup = view(setting, containerEl);
+				if (cleanup) this.callbackUnregisterHandles.push(cleanup);
+			},
 		]);
 		item.classList.add("is-collapsed");
 		this.graphControls.append(item);
