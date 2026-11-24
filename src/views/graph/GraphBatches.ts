@@ -251,6 +251,7 @@ const unitCylinder = (resolution: number) =>
 const unitCone = () =>
 	new THREE.ConeGeometry(0.25, 1, 8).translate(0, 0.5, 0).rotateX(Math.PI / 2);
 
+const WHITE = new THREE.Color(0xffffff);
 // opacity at or above this draws in the opaque batch
 const OPAQUE = 0.999;
 // opacity at or below this isn't drawn
@@ -282,6 +283,7 @@ export class GraphBatches {
 	private readonly scale = new THREE.Vector3();
 	private readonly a = new THREE.Vector3();
 	private readonly b = new THREE.Vector3();
+	private readonly translucentNodes: { obj: GraphObject; depth: number }[] = [];
 
 	constructor(private readonly source: BatchSource) {
 		const scene = source.scene();
@@ -299,11 +301,12 @@ export class GraphBatches {
 		this.previousBeforeRender = scene.onBeforeRender;
 		scene.onBeforeRender = (...args) => {
 			this.previousBeforeRender.apply(scene, args);
-			this.update();
+			// (renderer, scene, camera, ...)
+			this.update(args[2] as THREE.Object3D);
 		};
 	}
 
-	private update() {
+	private update(camera: THREE.Object3D) {
 		// lights only light anything if the camera's layer sees them; the
 		// library adds its lights after the batches exist, so check each frame
 		for (const child of this.source.scene().children)
@@ -315,7 +318,7 @@ export class GraphBatches {
 		if (nodes.length > 0 && !(nodes as NodeWithObject[]).some((n) => n.__threeObj)) return;
 		this.source.beginFrame();
 		this.updateGeometries();
-		this.updateNodes(nodes as NodeWithObject[]);
+		this.updateNodes(nodes as NodeWithObject[], camera);
 		this.updateLinks(links as LinkWithObjects[]);
 	}
 
@@ -334,25 +337,39 @@ export class GraphBatches {
 		}
 	}
 
-	// a node is the library's default sphere: a mesh at the node's position
-	private updateNodes(nodes: NodeWithObject[]) {
+	// a node is the library's default sphere: a mesh at the node's position.
+	// Translucent spheres (dimmed by a hover) write depth, so they're drawn
+	// farthest first, as three sorts separate transparent objects: otherwise
+	// a near one drawn first would hide a far one that should show through it
+	private updateNodes(nodes: NodeWithObject[], camera: THREE.Object3D) {
 		this.nodesOpaque.begin(nodes.length);
 		this.nodesTranslucent.begin(nodes.length);
+		const translucent = this.translucentNodes;
+		translucent.length = 0;
+		const c = camera.matrixWorld.elements;
 		for (const node of nodes) {
 			const obj = node.__threeObj;
 			if (!obj || !obj.__graphDefaultObj || !obj.material?.color) continue;
 			const alpha = obj.material.opacity;
 			if (alpha <= INVISIBLE) continue;
-			const r = obj.geometry?.parameters?.radius ?? 1;
-			this.matrix.copy(obj.matrixWorld).scale(this.scale.set(r, r, r));
-			(alpha >= OPAQUE ? this.nodesOpaque : this.nodesTranslucent).push(
-				this.matrix,
-				obj.material.color,
-				Math.min(1, alpha)
-			);
+			if (alpha < OPAQUE) {
+				const m = obj.matrixWorld.elements;
+				const depth = (m[12] - c[12]) ** 2 + (m[13] - c[13]) ** 2 + (m[14] - c[14]) ** 2;
+				translucent.push({ obj, depth });
+				continue;
+			}
+			this.pushNode(this.nodesOpaque, obj, alpha);
 		}
+		translucent.sort((a, b) => b.depth - a.depth);
+		for (const { obj } of translucent) this.pushNode(this.nodesTranslucent, obj, obj.material?.opacity ?? 1);
 		this.nodesOpaque.end();
 		this.nodesTranslucent.end();
+	}
+
+	private pushNode(batch: InstancedBatch, obj: GraphObject, alpha: number) {
+		const r = obj.geometry?.parameters?.radius ?? 1;
+		this.matrix.copy(obj.matrixWorld).scale(this.scale.set(r, r, r));
+		batch.push(this.matrix, obj.material?.color ?? WHITE, Math.min(1, alpha));
 	}
 
 	// a link is the library's cylinder or line; its arrowheads are placed
