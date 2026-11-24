@@ -5,6 +5,7 @@ declare module "three" {
 	export class Layers {
 		set(layer: number): void;
 		enable(layer: number): void;
+		disable(layer: number): void;
 		test(layers: Layers): boolean;
 	}
 	export class Vector3 {

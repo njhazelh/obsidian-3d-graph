@@ -43,12 +43,8 @@ export interface BatchSource {
 
 // Lambert material with a per-instance color and opacity (three r146's
 // instanceColor has no alpha)
-const instancedLambert = (transparent: boolean) => {
-	const material = new THREE.MeshLambertMaterial({
-		color: 0xffffff,
-		transparent,
-		depthWrite: !transparent,
-	});
+const instancedLambert = (transparent: boolean, depthWrite: boolean) => {
+	const material = new THREE.MeshLambertMaterial({ color: 0xffffff, transparent, depthWrite });
 	material.onBeforeCompile = (shader) => {
 		shader.vertexShader = shader.vertexShader
 			.replace(
@@ -60,7 +56,7 @@ const instancedLambert = (transparent: boolean) => {
 			.replace("#include <common>", "#include <common>\nvarying vec4 vInstanceRGBA;")
 			.replace("#include <color_fragment>", "#include <color_fragment>\ndiffuseColor *= vInstanceRGBA;");
 	};
-	material.customProgramCacheKey = () => `graph-batch-${transparent}`;
+	material.customProgramCacheKey = () => `graph-batch-${transparent}-${depthWrite}`;
 	return material;
 };
 
@@ -71,14 +67,15 @@ class InstancedBatch {
 	private capacity = 0;
 	private count = 0;
 	private readonly material: THREE.MeshLambertMaterial;
+	private readonly renderOrder: number;
 
 	constructor(
 		private readonly scene: THREE.Scene,
 		private geometry: THREE.BufferGeometry,
-		transparent: boolean,
-		private readonly renderOrder: number
+		{ transparent, depthWrite, renderOrder }: { transparent: boolean; depthWrite: boolean; renderOrder: number }
 	) {
-		this.material = instancedLambert(transparent);
+		this.renderOrder = renderOrder;
+		this.material = instancedLambert(transparent, depthWrite);
 	}
 
 	// Starts a frame; `max` is the most instances it can get
@@ -258,8 +255,16 @@ const unitCone = () =>
 const OPAQUE = 0.999;
 // opacity at or below this isn't drawn
 const INVISIBLE = 0.001;
-// render orders, as three-forcegraph and the plugin set them
-const LINK_ORDER = 10;
+// Links draw just before labels (10), so a label always covers the links
+// behind it: a batch sorts as one object at the origin, so at the labels'
+// order the far half of the labels would draw before every link
+const LINK_ORDER = 9;
+// as three-forcegraph's materials: spheres write depth even when
+// translucent (a dimmed node hides what's behind it), translucent links don't
+const OPAQUE_NODES = { transparent: false, depthWrite: true, renderOrder: 0 };
+const TRANSLUCENT_NODES = { transparent: true, depthWrite: true, renderOrder: 0 };
+const OPAQUE_LINKS = { transparent: false, depthWrite: true, renderOrder: LINK_ORDER };
+const TRANSLUCENT_LINKS = { transparent: true, depthWrite: false, renderOrder: LINK_ORDER };
 
 export class GraphBatches {
 	private readonly nodesOpaque: InstancedBatch;
@@ -282,11 +287,11 @@ export class GraphBatches {
 		const scene = source.scene();
 		this.nodeResolution = source.nodeResolution();
 		this.linkResolution = source.linkResolution();
-		this.nodesOpaque = new InstancedBatch(scene, unitSphere(this.nodeResolution), false, 0);
-		this.nodesTranslucent = new InstancedBatch(scene, unitSphere(this.nodeResolution), true, 0);
-		this.linksOpaque = new InstancedBatch(scene, unitCylinder(this.linkResolution), false, LINK_ORDER);
-		this.linksTranslucent = new InstancedBatch(scene, unitCylinder(this.linkResolution), true, LINK_ORDER);
-		this.arrows = new InstancedBatch(scene, unitCone(), false, 0);
+		this.nodesOpaque = new InstancedBatch(scene, unitSphere(this.nodeResolution), OPAQUE_NODES);
+		this.nodesTranslucent = new InstancedBatch(scene, unitSphere(this.nodeResolution), TRANSLUCENT_NODES);
+		this.linksOpaque = new InstancedBatch(scene, unitCylinder(this.linkResolution), OPAQUE_LINKS);
+		this.linksTranslucent = new InstancedBatch(scene, unitCylinder(this.linkResolution), TRANSLUCENT_LINKS);
+		this.arrows = new InstancedBatch(scene, unitCone(), OPAQUE_NODES);
 		this.lines = new LineBatch(scene, LINK_ORDER);
 
 		// runs after the scene's matrices are updated and before anything is
@@ -304,6 +309,10 @@ export class GraphBatches {
 		for (const child of this.source.scene().children)
 			if ((child as THREE.Light).isLight) child.layers.enable(RENDER_LAYER);
 		const { nodes, links } = this.source.graphData();
+		// new graph data whose objects the library hasn't made yet (it makes
+		// them a moment after the data is set): keep drawing the last frame's,
+		// as the library's old objects are still what's in the scene
+		if (nodes.length > 0 && !(nodes as NodeWithObject[]).some((n) => n.__threeObj)) return;
 		this.source.beginFrame();
 		this.updateGeometries();
 		this.updateNodes(nodes as NodeWithObject[]);

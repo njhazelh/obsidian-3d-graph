@@ -512,6 +512,8 @@ export class ForceGraph {
 	private onContainerResized = () => {
 		if (!this.hasSize) return;
 		this.updateDimensions();
+		// labels hide below a size in screen pixels, which depends on the height
+		this.updateLabelFade();
 		// first shown now (hidden while loading): bounce in, like on load
 		if (this.pendingBounce && this.startBounce()) return;
 		if (!this.shouldFollowLayout) return;
@@ -1362,6 +1364,10 @@ export class ForceGraph {
 		material.opacity = (dimmed ? 0.12 : 1) * fade;
 		sprite.visible =
 			material.opacity > 0.01 && (this.display.showLabels || !dimmed);
+		// a hidden label isn't a hover, click or drag target for its node
+		// (raycasting ignores `visible`, so take it off the library's layer)
+		if (sprite.visible) sprite.layers.enable(0);
+		else sprite.layers.disable(0);
 	}
 
 	private onNodeHover = (node: Node | null) => {
