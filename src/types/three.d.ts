@@ -123,7 +123,7 @@ declare module "three" {
 			depthWrite?: boolean;
 			blending?: number;
 		});
-		uniforms: Record<string, { value: number }>;
+		uniforms: Record<string, { value: unknown }>;
 		blending: number;
 	}
 	export class SpriteMaterial extends Material {
@@ -133,6 +133,15 @@ declare module "three" {
 		constructor(canvas: HTMLCanvasElement);
 		minFilter: number;
 		generateMipmaps: boolean;
+	}
+	export class DataTexture {
+		constructor(data: Float32Array, width: number, height: number, format: number, type: number);
+		image: { data: Float32Array; width: number; height: number };
+		minFilter: number;
+		magFilter: number;
+		generateMipmaps: boolean;
+		needsUpdate: boolean;
+		dispose(): void;
 	}
 
 	export class Mesh extends Object3D {
@@ -161,9 +170,13 @@ declare module "three" {
 	}
 	export class Points extends Object3D {
 		constructor(geometry: BufferGeometry, material: ShaderMaterial);
+		geometry: BufferGeometry;
 	}
 
 	export const LinearFilter: number;
+	export const NearestFilter: number;
+	export const RGBAFormat: number;
+	export const FloatType: number;
 	export const AdditiveBlending: number;
 	export const NormalBlending: number;
 	export const DynamicDrawUsage: number;

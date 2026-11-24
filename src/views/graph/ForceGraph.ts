@@ -48,10 +48,12 @@ const WARMUP_NODE_TICKS = 150_000; // node × tick budget for the warm-up
 const MIN_WARMUP_TICKS = 20;
 const warmupTicks = (nodes: number) =>
 	Math.max(MIN_WARMUP_TICKS, Math.min(WARMUP_TICKS, Math.round(WARMUP_NODE_TICKS / Math.max(1, nodes))));
-// Motes are moved on the CPU every frame (about 60 ns each); past this many
-// in total, each link gets fewer. On an 18k-link vault: 9 per link at ~57 fps
-// (60k gave 3 per link at 60 fps; 250k, 13 per link at ~49 fps)
-const MOTE_BUDGET = 180_000;
+// Motes move on the GPU (see MoteField); past this many in total, each link
+// gets fewer. On an 18k-link vault on an M-series Mac: 163 per link at 60 fps,
+// zoomed in or out (3.7M motes gave 52 fps)
+const MOTE_BUDGET = 3_000_000;
+// the timelapse lays motes out again every step (60 ms)
+const TIMELAPSE_MOTE_BUDGET = 150_000;
 // segments around each node sphere; small spheres on a big graph don't need many
 const nodeResolution = (nodes: number) => (nodes > 2000 ? 8 : nodes > 500 ? 12 : 20);
 const COOLDOWN_MS = 2500;
@@ -135,6 +137,8 @@ export class ForceGraph {
 	private readonly moteFrameState = { always: true, highlight: false };
 	private lastFrameTime = 0;
 	private cooldownMs = COOLDOWN_MS;
+	// the timelapse (animate) is adding nodes step by step
+	private timelapsing = false;
 
 	constructor(
 		plugin: Graph3dPlugin,
@@ -997,6 +1001,7 @@ export class ForceGraph {
 	// that were already on screen so the layout doesn't jump
 	private setGraphData(graph: Graph, reframe: boolean) {
 		window.clearTimeout(this.animationTimer);
+		this.timelapsing = false;
 		this.endBounce();
 		const previous = new Map<string, Record<string, number>>();
 		this.instance.graphData().nodes.forEach((n: Record<string, unknown>) => {
@@ -1091,6 +1096,8 @@ export class ForceGraph {
 						present.has(endpointId(l.target))
 				),
 			});
+			// each step lays the motes out again; a smaller budget keeps steps quick
+			this.timelapsing = count < files.length;
 			this.resetMotes();
 			if (count < files.length)
 				this.animationTimer = window.setTimeout(step, 60);
@@ -1417,7 +1424,12 @@ export class ForceGraph {
 		count: () =>
 			Math.min(
 				this.display.motesPerLink,
-				Math.max(1, Math.floor(MOTE_BUDGET / Math.max(1, this.graph.links.length)))
+				Math.max(
+					1,
+					Math.floor(
+						(this.timelapsing ? TIMELAPSE_MOTE_BUDGET : MOTE_BUDGET) / Math.max(1, this.graph.links.length)
+					)
+				)
 			),
 		colors: (link: Link) => {
 			if (this.isHighlightedLink(link))

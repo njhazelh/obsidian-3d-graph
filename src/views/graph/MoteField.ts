@@ -8,6 +8,12 @@ import { RENDER_LAYER } from "./GraphBatches";
 // source to the target, each bowed out by its own amount in its own direction
 // around the link, together forming a spindle. Motes travel each line in an
 // evenly spaced train, so the lines read as dotted arcs of light.
+//
+// The motes move on the GPU. Each mote's shape (its line's direction and
+// bow, its place in the train, its size) is fixed when the links are laid
+// out. Each frame only the links change: their ends, colors and brightness
+// go into a small float texture (LINK_TEXELS texels per link), and the
+// vertex shader places every mote on its link's arc.
 
 type Positioned = Node & { x?: number; y?: number; z?: number };
 type Endpoint = string | Positioned;
@@ -29,37 +35,104 @@ export interface MoteStyle {
 	additive: boolean; // glow on dark backgrounds; normal blending on light
 }
 
-// Stable pseudo-random number in [0, 1) for a string
-const hash01 = (text: string): number => {
+// Stable 32-bit hash of a string (FNV-1a with a murmur3 finalizer)
+const hashString = (text: string): number => {
 	let h = 2166136261;
 	for (let i = 0; i < text.length; i++) {
 		h ^= text.charCodeAt(i);
 		h = Math.imul(h, 16777619);
 	}
-	// final avalanche (murmur3 fmix32) so near-identical strings, like
-	// "…#1" and "…#2", still give unrelated values
+	return fmix(h);
+};
+// murmur3's fmix32: near-identical inputs give unrelated outputs
+const fmix = (h: number): number => {
 	h ^= h >>> 16;
 	h = Math.imul(h, 0x85ebca6b);
 	h ^= h >>> 13;
 	h = Math.imul(h, 0xc2b2ae35);
 	h ^= h >>> 16;
-	return (h >>> 0) / 4294967296;
+	return h >>> 0;
 };
+// Stable pseudo-random number in [0, 1) for a link, an index and a salt
+const rand = (key: number, index: number, salt: number): number =>
+	fmix(key ^ Math.imul(index + 1, 0x9e3779b1) ^ Math.imul(salt, 0x27d4eb2f)) / 4294967296;
+// salts, so each random property of a line or mote is independent
+const enum Salt {
+	Turn = 1,
+	Angle,
+	Bow,
+	Speed,
+	Offset,
+	Jitter,
+	Size,
+	Twinkle,
+}
 
 const endId = (end: Endpoint) => (typeof end === "string" ? end : end.id);
 
+// texels per link in the link texture: source end, target end, source
+// color + brightness, target color
+const LINK_TEXELS = 4;
+const TEXTURE_WIDTH = 4096;
+
 const VERTEX = `
-attribute float aAlpha;
-attribute float aSize;
-attribute vec3 aColor;
+uniform sampler2D uLinks;
+uniform float uTime;
+uniform float uSpeed;
+uniform float uSpread;
+uniform float uSize;
 uniform float uScale;
+uniform float uFlicker;
+// position: (link index + 1, negative for a reversed mote; phase; speed)
+attribute vec4 aShape; // cos and sin of the line's angle, bow, least bow
+attribute vec2 aLook; // size, twinkle phase
 varying float vAlpha;
 varying vec3 vColor;
+
+vec4 linkTexel(int i) {
+	return texelFetch(uLinks, ivec2(i % ${TEXTURE_WIDTH}, i / ${TEXTURE_WIDTH}), 0);
+}
+
 void main() {
-	vAlpha = aAlpha;
-	vColor = aColor;
-	vec4 mv = modelViewMatrix * vec4(position, 1.0);
-	gl_PointSize = aSize * uScale / -mv.z;
+	int link = int(abs(position.x)) - 1;
+	vec4 from = linkTexel(link * ${LINK_TEXELS} + 2);
+	float bright = from.a;
+	if (bright <= 0.0) {
+		// hidden: off screen, nothing to rasterize
+		gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+		gl_PointSize = 0.0;
+		vAlpha = 0.0;
+		vColor = vec3(0.0);
+		return;
+	}
+	vec3 a = linkTexel(link * ${LINK_TEXELS}).xyz;
+	vec3 b = linkTexel(link * ${LINK_TEXELS} + 1).xyz;
+	vec3 to = linkTexel(link * ${LINK_TEXELS} + 3).rgb;
+
+	// position along the arc, source (0) to target (1); color follows it,
+	// so a reversed mote starts in the target's color
+	float progress = fract(position.y + uTime * uSpeed * position.z);
+	float t = position.x < 0.0 ? 1.0 - progress : progress;
+
+	vec3 d = b - a;
+	float len = max(length(d), 1e-6);
+	vec3 u = d / len;
+	// two unit vectors perpendicular to the link
+	vec3 v = normalize(cross(u, abs(u.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+	vec3 w = cross(u, v);
+	// control point: the midpoint pushed out around the link
+	float bow = max(aShape.z * uSpread, aShape.w) * len;
+	vec3 c = (a + b) * 0.5 + (v * aShape.x + w * aShape.y) * bow;
+	vec3 p = (1.0 - t) * (1.0 - t) * a + 2.0 * (1.0 - t) * t * c + t * t * b;
+
+	vColor = mix(from.rgb, to, t);
+	// fade in at the source, out at the target; solid dots hold steady,
+	// soft motes twinkle
+	float twinkle = 1.0 - uFlicker * (1.0 - sin(uTime * 3.0 + aLook.y));
+	vAlpha = sin(3.14159265 * t) * twinkle * bright;
+
+	vec4 mv = modelViewMatrix * vec4(p, 1.0);
+	gl_PointSize = uSize * aLook.x * uScale / -mv.z;
 	gl_Position = projectionMatrix * mv;
 }`;
 
@@ -68,6 +141,7 @@ uniform float uSolid;
 varying float vAlpha;
 varying vec3 vColor;
 void main() {
+	if (vAlpha <= 0.0) discard;
 	float d = length(gl_PointCoord - vec2(0.5));
 	if (d > 0.5) discard;
 	// soft: a bright core inside a glow, the core a little whiter, like a
@@ -81,149 +155,154 @@ void main() {
 	gl_FragColor = vec4(color, vAlpha * mix(soft, solid, uSolid));
 }`;
 
-interface Mote {
-	link: number; // index into links
-	phase: number;
-	speed: number;
-	angle: number;
-	cos: number; // cos and sin of angle
-	sin: number;
-	bow: number; // 0..1, scaled by spread
-	minBow: number; // least bow as a fraction of the link length, whatever the spread
-	reverse: boolean; // flows target -> source (half the lines of a two-way link)
-	size: number;
-	twinkle: number;
-}
-
 export class MoteField {
 	private readonly scene: THREE.Object3D;
 	private points: THREE.Points | null = null;
 	private geometry: THREE.BufferGeometry | null = null;
 	private material: THREE.ShaderMaterial | null = null;
+	private texture: THREE.DataTexture | null = null;
+	private textureData = new Float32Array(0);
 	private links: Link[] = [];
-	private motes: Mote[] = [];
-	// each link's motes are contiguous: motes[linkStart[i] .. linkStart[i + 1])
-	private linkStart: number[] = [0];
-	private capacity = 0;
+	private moteCount = 0;
 	private time = 0;
-	private cleared = false; // every mote was hidden on the last frame
 	private readonly colorCache = new Map<string, THREE.Color>();
 
 	constructor(scene: THREE.Object3D) {
 		this.scene = scene;
 	}
 
+	get count() {
+		return this.moteCount;
+	}
+
 	// Lays out motes for the given links (call when links or counts change)
 	public setLinks(links: Link[], style: MoteStyle) {
 		this.links = links;
-		this.motes = [];
-		this.linkStart = [0];
+		const counts = links.map((link) => Math.max(0, Math.round(style.count(link))));
+		const total = counts.reduce((a, b) => a + b, 0);
+		this.moteCount = total;
+
+		// mote attributes; see VERTEX
+		const position = new Float32Array(total * 3);
+		const shape = new Float32Array(total * 4);
+		const look = new Float32Array(total * 2);
 		const golden = Math.PI * (3 - Math.sqrt(5));
+		const sep = Math.min(1, Math.max(0, style.coalescence));
+		let m = 0;
 		links.forEach((link, index) => {
-			const key = `${endId(link.source as Endpoint)}|${endId(link.target as Endpoint)}`;
-			const n = Math.max(0, Math.round(style.count(link)));
-			if (n === 0) {
-				this.linkStart.push(this.motes.length);
-				return;
-			}
+			const n = counts[index];
+			if (n === 0) return;
+			const key = hashString(`${endId(link.source as Endpoint)}|${endId(link.target as Endpoint)}`);
 			// a few field lines per link; motes are shared out between them.
 			// Notes that link to each other get lines flowing both ways, so a
 			// two-way link needs an even number of lines, half each way.
 			const mutual = link.mutual === true && n >= 2;
 			let lineCount = Math.max(1, Math.min(n, Math.round(Math.sqrt(n) * 0.9)));
 			if (mutual) lineCount = Math.min(n - (n % 2), lineCount + (lineCount % 2));
-			const turn = hash01(`${key}#turn`) * Math.PI * 2;
-			const sep = mutual ? Math.min(1, Math.max(0, style.coalescence)) : 0;
-			const lines = Array.from({ length: lineCount }, (_, l) => {
-				const r = (salt: string) => hash01(`${key}#line${l}${salt}`);
+			const lineSep = mutual ? sep : 0;
+			const turn = rand(key, 0, Salt.Turn) * Math.PI * 2;
+			// a line's motes: the first is the line's index, the rest follow
+			// every lineCount
+			for (let l = 0; l < lineCount; l++) {
 				// alternate lines run the other way on a two-way link
 				const reverse = mutual && l % 2 === 1;
 				// spread evenly around the link, with a little jitter
-				let angle = turn + l * golden + (r("a") - 0.5) * 0.6;
+				let angle = turn + l * golden + (rand(key, l, Salt.Angle) - 0.5) * 0.6;
 				// most lines bow a little, a few bow a lot: a spindle
-				let bow = 0.15 + 0.85 * Math.pow(r("b"), 0.8);
-				if (sep > 0) {
+				let bow = 0.15 + 0.85 * Math.pow(rand(key, l, Salt.Bow), 0.8);
+				if (lineSep > 0) {
 					// each stream gathers around its own anchor, on opposite
 					// sides of the link: angles narrow toward the anchor and
 					// the least-bowed lines move out, off the shared axis;
 					const anchor = turn + (reverse ? Math.PI : 0);
 					const relative = Math.atan2(Math.sin(angle - anchor), Math.cos(angle - anchor));
 					// (square root: the streams stop overlapping from about halfway)
-					angle = anchor + relative * (1 - 0.8 * Math.sqrt(sep));
-					bow = bow + (1 - bow) * 0.35 * sep;
+					angle = anchor + relative * (1 - 0.8 * Math.sqrt(lineSep));
+					bow = bow + (1 - bow) * 0.35 * lineSep;
 					// and the streams loop further out, up to 2.5x the bow at 1,
 					// like two field loops on either side of the link
-					bow *= 1 + 1.5 * sep;
+					bow *= 1 + 1.5 * lineSep;
 				}
-				return {
-					angle,
-					bow,
-					speed: 0.8 + 0.4 * r("s"),
-					offset: r("o"),
-					reverse,
-				};
-			});
-			const perLine = new Array(lineCount).fill(0);
-			for (let i = 0; i < n; i++) perLine[i % lineCount]++;
-			for (let i = 0; i < n; i++) {
-				const line = lines[i % lineCount];
-				const slot = Math.floor(i / lineCount);
-				const r = (salt: string) => hash01(`${key}#${i}${salt}`);
-				this.motes.push({
-					link: index,
+				const speed = 0.8 + 0.4 * rand(key, l, Salt.Speed);
+				const offset = rand(key, l, Salt.Offset);
+				const cos = Math.cos(angle);
+				const sin = Math.sin(angle);
+				const onLine = Math.ceil((n - l) / lineCount);
+				const linkValue = (index + 1) * (reverse ? -1 : 1);
+				for (let slot = 0; slot < onLine; slot++) {
+					const i = l + slot * lineCount; // this mote's index within the link
 					// an evenly spaced train along the line, slightly jittered
-					phase: line.offset + (slot + (r("j") - 0.5) * 0.15) / perLine[i % lineCount],
-					speed: line.speed,
-					angle: line.angle,
-					cos: Math.cos(line.angle),
-					sin: Math.sin(line.angle),
-					bow: line.bow,
+					const phase = offset + (slot + (rand(key, i, Salt.Jitter) - 0.5) * 0.15) / onLine;
+					position[m * 3] = linkValue;
+					position[m * 3 + 1] = phase - Math.floor(phase);
+					position[m * 3 + 2] = speed;
+					shape[m * 4] = cos;
+					shape[m * 4 + 1] = sin;
+					shape[m * 4 + 2] = bow;
 					// keeps the streams apart even with a small spread
-					minBow: line.bow * sep * 0.12,
-					reverse: line.reverse,
-					size: 0.6 + 0.7 * r("z"),
-					twinkle: r("t") * Math.PI * 2,
-				});
+					shape[m * 4 + 3] = bow * lineSep * 0.12;
+					look[m * 2] = 0.6 + 0.7 * rand(key, i, Salt.Size);
+					look[m * 2 + 1] = rand(key, i, Salt.Twinkle) * Math.PI * 2;
+					m++;
+				}
 			}
-			this.linkStart.push(this.motes.length);
 		});
-		this.cleared = false;
-		this.ensureCapacity(this.motes.length, style);
-		// update() fills the buffers and draw range with the visible motes
-		this.geometry?.setDrawRange(0, 0);
+
+		this.ensureMaterial(style);
+		this.ensureTexture(links.length);
+		this.geometry?.dispose();
+		const geometry = new THREE.BufferGeometry();
+		geometry.setAttribute("position", new THREE.BufferAttribute(position, 3));
+		geometry.setAttribute("aShape", new THREE.BufferAttribute(shape, 4));
+		geometry.setAttribute("aLook", new THREE.BufferAttribute(look, 2));
+		geometry.setDrawRange(0, total);
+		this.geometry = geometry;
+		if (this.points && this.material) this.points.geometry = geometry;
+		else if (this.material) {
+			this.points = new THREE.Points(geometry, this.material);
+			this.points.frustumCulled = false;
+			this.points.renderOrder = 5;
+			this.points.layers.set(RENDER_LAYER);
+			this.scene.add(this.points);
+		}
 	}
 
-	private ensureCapacity(n: number, style: MoteStyle) {
-		if (this.points && n <= this.capacity && this.material) {
+	private ensureMaterial(style: MoteStyle) {
+		if (this.material) {
 			this.material.blending = style.additive ? THREE.AdditiveBlending : THREE.NormalBlending;
 			return;
 		}
-		this.disposeObjects();
-		this.capacity = Math.max(64, Math.ceil(n * 1.25));
-		const geometry = new THREE.BufferGeometry();
-		const attr = (size: number) => {
-			const a = new THREE.BufferAttribute(new Float32Array(this.capacity * size), size);
-			a.setUsage(THREE.DynamicDrawUsage);
-			return a;
-		};
-		geometry.setAttribute("position", attr(3));
-		geometry.setAttribute("aColor", attr(3));
-		geometry.setAttribute("aAlpha", attr(1));
-		geometry.setAttribute("aSize", attr(1));
 		this.material = new THREE.ShaderMaterial({
-			uniforms: { uScale: { value: 400 }, uSolid: { value: style.solidity } },
+			uniforms: {
+				uLinks: { value: null },
+				uTime: { value: 0 },
+				uSpeed: { value: style.speed },
+				uSpread: { value: style.spread },
+				uSize: { value: style.size },
+				uScale: { value: 400 },
+				uFlicker: { value: 0 },
+				uSolid: { value: style.solidity },
+			},
 			vertexShader: VERTEX,
 			fragmentShader: FRAGMENT,
 			transparent: true,
 			depthWrite: false,
 			blending: style.additive ? THREE.AdditiveBlending : THREE.NormalBlending,
 		});
-		this.geometry = geometry;
-		this.points = new THREE.Points(geometry, this.material);
-		this.points.frustumCulled = false;
-		this.points.renderOrder = 5;
-		this.points.layers.set(RENDER_LAYER);
-		this.scene.add(this.points);
+	}
+
+	private ensureTexture(links: number) {
+		const height = Math.max(1, Math.ceil((links * LINK_TEXELS) / TEXTURE_WIDTH));
+		if (this.texture && this.texture.image.height >= height) return;
+		this.texture?.dispose();
+		this.textureData = new Float32Array(TEXTURE_WIDTH * height * 4);
+		const texture = new THREE.DataTexture(this.textureData, TEXTURE_WIDTH, height, THREE.RGBAFormat, THREE.FloatType);
+		texture.minFilter = THREE.NearestFilter;
+		texture.magFilter = THREE.NearestFilter;
+		texture.generateMipmaps = false;
+		texture.needsUpdate = true;
+		this.texture = texture;
+		if (this.material) this.material.uniforms.uLinks.value = texture;
 	}
 
 	private color(css: string): THREE.Color {
@@ -237,112 +316,58 @@ export class MoteField {
 		return c;
 	}
 
-	// Moves every mote along its arc; dt in seconds
+	// Moves the motes along their arcs; dt in seconds. Writes each link's
+	// ends, colors and brightness for the shader.
 	public update(dt: number, style: MoteStyle, viewportHeight: number) {
-		if (!this.geometry || !this.material) return;
+		const material = this.material;
+		const texture = this.texture;
+		if (!material || !texture || !this.points) return;
 		this.time += dt;
-		this.material.uniforms.uScale.value = viewportHeight / 2;
-		this.material.uniforms.uSolid.value = style.solidity;
-		this.material.blending = style.additive ? THREE.AdditiveBlending : THREE.NormalBlending;
+		const uniforms = material.uniforms;
+		uniforms.uTime.value = this.time;
+		uniforms.uSpeed.value = style.speed;
+		uniforms.uSpread.value = style.spread;
+		uniforms.uSize.value = style.size;
+		uniforms.uScale.value = viewportHeight / 2;
+		uniforms.uFlicker.value = 0.25 * (1 - style.solidity);
+		uniforms.uSolid.value = style.solidity;
+		material.blending = style.additive ? THREE.AdditiveBlending : THREE.NormalBlending;
 
-		const pos = this.geometry.attributes.position.array as Float32Array;
-		const col = this.geometry.attributes.aColor.array as Float32Array;
-		const alpha = this.geometry.attributes.aAlpha.array as Float32Array;
-		const size = this.geometry.attributes.aSize.array as Float32Array;
-
-		// only the visible links' motes are written, packed at the start of
-		// the buffers, and only those are uploaded and drawn: hovering one
-		// link in lines mode costs that link's motes, not the whole vault's.
-		// Runs for every mote every frame, so it sticks to plain numbers.
-		const speed = this.time * style.speed;
-		const flicker = 0.25 * (1 - style.solidity);
-		const twinkleTime = this.time * 3;
-		let i = 0;
-		for (let link = 0; link < this.links.length; link++) {
-			const first = this.linkStart[link];
-			const last = this.linkStart[link + 1];
-			if (first === last) continue;
-			const l = this.links[link];
-			const bright = style.brightness(l);
+		const data = this.textureData;
+		let anyVisible = false;
+		for (let i = 0; i < this.links.length; i++) {
+			const link = this.links[i];
+			const o = i * LINK_TEXELS * 4;
+			const s = link.source as Endpoint;
+			const t = link.target as Endpoint;
+			const bright =
+				typeof s === "string" || typeof t === "string" || s.x === undefined || t.x === undefined
+					? 0
+					: style.brightness(link);
+			data[o + 11] = bright; // source color texel's alpha
 			if (bright <= 0) continue;
-			const s = l.source as Endpoint;
-			const t = l.target as Endpoint;
-			if (typeof s === "string" || typeof t === "string" || s.x === undefined || t.x === undefined)
-				continue;
-			const ax = s.x ?? 0, ay = s.y ?? 0, az = s.z ?? 0;
-			const bx = t.x ?? 0, by = t.y ?? 0, bz = t.z ?? 0;
-			const dx = bx - ax, dy = by - ay, dz = bz - az;
-			const len = Math.hypot(dx, dy, dz) || 1;
-			const ux = dx / len, uy = dy / len, uz = dz / len;
-			// two unit vectors perpendicular to the link
-			const upRef = Math.abs(uy) < 0.9;
-			const rx = upRef ? 0 : 1, ry = upRef ? 1 : 0, rz = 0;
-			let vx = uy * rz - uz * ry, vy = uz * rx - ux * rz, vz = ux * ry - uy * rx;
-			const vl = Math.hypot(vx, vy, vz) || 1;
-			vx /= vl;
-			vy /= vl;
-			vz /= vl;
-			const wx = uy * vz - uz * vy, wy = uz * vx - ux * vz, wz = ux * vy - uy * vx;
-			const mx = (ax + bx) / 2, my = (ay + by) / 2, mz = (az + bz) / 2;
-			const [fromCss, toCss] = style.colors(l);
+			anyVisible = true;
+			const a = s as Positioned;
+			const b = t as Positioned;
+			data[o] = a.x ?? 0;
+			data[o + 1] = a.y ?? 0;
+			data[o + 2] = a.z ?? 0;
+			data[o + 4] = b.x ?? 0;
+			data[o + 5] = b.y ?? 0;
+			data[o + 6] = b.z ?? 0;
+			const [fromCss, toCss] = style.colors(link);
 			const from = this.color(fromCss);
 			const to = this.color(toCss);
-
-			for (let k = first; k < last; k++) {
-				const m = this.motes[k];
-				const o = i * 3;
-				const progress = (((m.phase + speed * m.speed) % 1) + 1) % 1;
-				// position along the arc, source (0) to target (1); color follows
-				// it, so a reversed mote starts in the target's color
-				const p = m.reverse ? 1 - progress : progress;
-				const bow = Math.max(m.bow * style.spread, m.minBow) * len;
-				const cos = m.cos * bow;
-				const sin = m.sin * bow;
-				// control point: the midpoint pushed out around the link
-				const cx = mx + vx * cos + wx * sin;
-				const cy = my + vy * cos + wy * sin;
-				const cz = mz + vz * cos + wz * sin;
-				const k0 = (1 - p) * (1 - p);
-				const k1 = 2 * (1 - p) * p;
-				const k2 = p * p;
-				pos[o] = k0 * ax + k1 * cx + k2 * bx;
-				pos[o + 1] = k0 * ay + k1 * cy + k2 * by;
-				pos[o + 2] = k0 * az + k1 * cz + k2 * bz;
-
-				col[o] = from.r + (to.r - from.r) * p;
-				col[o + 1] = from.g + (to.g - from.g) * p;
-				col[o + 2] = from.b + (to.b - from.b) * p;
-
-				// fade in at the source, out at the target; solid dots hold
-				// steady, soft motes twinkle
-				const twinkle = 1 - flicker * (1 - Math.sin(twinkleTime + m.twinkle));
-				alpha[i] = Math.sin(Math.PI * p) * twinkle * bright;
-				size[i] = style.size * m.size;
-				i++;
-			}
+			data[o + 8] = from.r;
+			data[o + 9] = from.g;
+			data[o + 10] = from.b;
+			data[o + 12] = to.r;
+			data[o + 13] = to.g;
+			data[o + 14] = to.b;
 		}
-		// all hidden, and already cleared last frame: nothing to do
-		if (i === 0 && this.cleared) return;
-		this.cleared = i === 0;
-
-		this.geometry.setDrawRange(0, i);
-		// an empty range would upload the whole buffer (WebGL2 reads a zero
-		// length as "to the end"), and nothing is drawn anyway
-		if (i === 0) return;
-		const attributes = this.geometry.attributes;
-		(
-			[
-				["position", 3],
-				["aColor", 3],
-				["aAlpha", 1],
-				["aSize", 1],
-			] as const
-		).forEach(([name, itemSize]) => {
-			const attribute = attributes[name];
-			attribute.updateRange.offset = 0;
-			attribute.updateRange.count = i * itemSize;
-			attribute.needsUpdate = true;
-		});
+		// nothing lit (lines mode with nothing hovered): skip the draw
+		this.points.visible = anyVisible && this.moteCount > 0;
+		if (anyVisible) texture.needsUpdate = true;
 	}
 
 	// forget cached colors (theme or cluster colors changed)
@@ -350,20 +375,16 @@ export class MoteField {
 		this.colorCache.clear();
 	}
 
-	private disposeObjects() {
+	public dispose() {
 		if (this.points) this.scene.remove(this.points);
 		this.geometry?.dispose();
 		this.material?.dispose();
+		this.texture?.dispose();
 		this.points = null;
 		this.geometry = null;
 		this.material = null;
-		this.capacity = 0;
-	}
-
-	public dispose() {
-		this.disposeObjects();
+		this.texture = null;
 		this.links = [];
-		this.motes = [];
-		this.linkStart = [0];
+		this.moteCount = 0;
 	}
 }

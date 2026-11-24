@@ -78,7 +78,7 @@ export const ParticleSettingsView = (
 	containerEl: HTMLElement
 ) => {
 	const { slider } = controls(displaySettings, containerEl);
-	slider("Per link", "motesPerLink", 1, 40, 1);
+	slider("Per link", "motesPerLink", 1, 200, 1);
 	slider("Size", "particleSize", 0.5, 8, 0.5);
 	slider("Speed", "particleSpeed", 1, 10, 0.5);
 	slider("Spread", "particleArc", 0, 1, 0.05);
