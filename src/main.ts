@@ -41,7 +41,9 @@ export default class Graph3dPlugin extends Plugin {
 
 	async onload() {
 		await this.init();
-		// lets Page Preview show notes when hovering nodes with Cmd/Ctrl held
+		// a Page Preview source; previews show on a plain hover once its
+		// "require ⌘" option is turned off (⌘ in the graph acts as if no node
+		// were there, see Graph3dView)
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		(this as any).registerHoverLinkSource?.("3d-graph", {
 			display: "3D Graph",

@@ -86,6 +86,10 @@ const MIN_LABEL_PX = 6;
 // the orbit controls' 5% per notch of 100 px)
 const ZOOM_PER_PIXEL = 0.0005;
 
+// a click or press with a modifier acts as if no node were under the pointer
+export const isModified = (event: MouseEvent) =>
+	event.metaKey || event.ctrlKey || event.shiftKey || event.altKey;
+
 // the parts of three's OrbitControls the wheel zoom uses
 interface OrbitControlsLike {
 	target: THREE.Vector3;
@@ -188,6 +192,7 @@ export class ForceGraph {
 		// zoom toward the cursor; caught on the way down to the canvas, so the
 		// orbit controls' own wheel zoom (toward the center) never sees it
 		this.rootHtmlElement.addEventListener("wheel", this.onWheel, { capture: true, passive: false });
+		this.rootHtmlElement.addEventListener("pointerdown", this.onPointerDown, { capture: true });
 
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const controls = this.instance.controls() as any;
@@ -205,6 +210,7 @@ export class ForceGraph {
 			EventBus.off("core-graph-options-changed", this.onCoreOptionsChanged);
 			this.rootHtmlElement.removeEventListener("mousemove", trackMouse);
 			this.rootHtmlElement.removeEventListener("wheel", this.onWheel, { capture: true });
+			this.rootHtmlElement.removeEventListener("pointerdown", this.onPointerDown, { capture: true });
 			controls?.removeEventListener?.("change", this.updateLabelFade);
 			controls?.removeEventListener?.("start", onUserCamera);
 			resizeObserver.disconnect();
@@ -581,6 +587,43 @@ export class ForceGraph {
 		this.userMovedCamera = true;
 		controls.update(); // tells listeners (label fade) the camera changed
 	};
+
+	// A press with a modifier (⌘, Ctrl, Shift, Option) acts as if no node
+	// were under the pointer: the camera controls take it (a modified drag
+	// pans) and the library's drag controls don't grab the node. The drag
+	// controls hit-test once, on the press, so for that press only the nodes
+	// and their labels leave the layer they hit-test (layer 0). They're back
+	// as the press bubbles up past the canvas, before any frame can render
+	// (a frame's hover test would otherwise see no node and drop the hover).
+	// A modified click is a background click: see the click handlers in
+	// Graph3dView.
+	private onPointerDown = (event: PointerEvent) => {
+		if (!isModified(event) || !this.onGraphSurface(event)) return;
+		this.setNodesHittable(false);
+		let restored = false;
+		const restore = () => {
+			if (restored) return;
+			restored = true;
+			this.rootHtmlElement.removeEventListener("pointerdown", restore);
+			this.setNodesHittable(true);
+		};
+		this.rootHtmlElement.addEventListener("pointerdown", restore);
+		// in case something stops the press before it bubbles back up
+		window.setTimeout(restore);
+	};
+
+	private setNodesHittable(hittable: boolean) {
+		const nodes = this.instance.graphData().nodes as (Node & { __threeObj?: THREE.Object3D })[];
+		for (const node of nodes) {
+			node.__threeObj?.traverse((o) => {
+				// a hidden label stays off the layer (see applyLabelHighlight)
+				if (hittable && (o as THREE.Sprite).material && !o.visible) return;
+				if (hittable) o.layers.enable(0);
+				else o.layers.disable(0);
+			});
+		}
+	}
+
 
 	// The settings panel and the cluster legend share the view's container
 	// with the canvas, so events caught on the container check where they're

@@ -1,7 +1,7 @@
 import { ItemView, Menu, TFile, WorkspaceLeaf } from "obsidian";
 import Node from "../../graph/Node";
 import Link from "../../graph/Link";
-import { ForceGraph } from "./ForceGraph";
+import { ForceGraph, isModified } from "./ForceGraph";
 import { GraphSettingsView } from "../settings/GraphSettingsView";
 import Graph3dPlugin from "src/main";
 
@@ -69,6 +69,15 @@ export class Graph3dView extends ItemView {
 		return file instanceof TFile ? file : null;
 	}
 
+	// Page Preview's setting for this source: whether a preview needs ⌘/Ctrl
+	private previewNeedsModifier(): boolean {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const app = this.app as any;
+		const option = app.internalPlugins?.getPluginById?.("page-preview")?.instance?.options?.["3d-graph"];
+		if (typeof option === "boolean") return option;
+		return app.workspace?.hoverLinkSources?.["3d-graph"]?.defaultMod ?? true;
+	}
+
 	private appendGraph(viewContent: HTMLElement) {
 		this.forceGraph = new ForceGraph(
 			this.plugin,
@@ -76,9 +85,13 @@ export class Graph3dView extends ItemView {
 			this.isLocalGraph
 		);
 
-		// Cmd/Ctrl + hover shows a page preview, like the 2D graph
+		// Hovering a note shows a page preview only when Page Preview is set
+		// to show 3D Graph previews without ⌘: a modifier makes the pointer act
+		// as if no node were there, and Page Preview would also open a preview
+		// offered on a plain hover as soon as ⌘ is pressed (say, to ⌘-click).
 		this.forceGraph.onHover = (node, event) => {
-			if (!node || !event || node.kind === "tag") return;
+			if (!node || !event || node.kind === "tag" || isModified(event)) return;
+			if (this.previewNeedsModifier()) return;
 			this.app.workspace.trigger("hover-link", {
 				event,
 				source: "3d-graph",
@@ -92,7 +105,9 @@ export class Graph3dView extends ItemView {
 		this.forceGraph
 			.getInstance()
 			.onNodeClick((node: Node, event: MouseEvent) => {
-				const newTab = event.metaKey || event.ctrlKey;
+				// with a modifier the click acts as if no node were there, and a
+				// background click does nothing
+				if (isModified(event)) return;
 				if (node.kind === "tag") {
 					// a tag opens a search for it
 					// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -104,19 +119,17 @@ export class Graph3dView extends ItemView {
 				}
 				if (node.kind === "unresolved") {
 					// like the 2D graph: clicking a missing note creates it
-					this.app.workspace.openLinkText(node.name, "", newTab);
+					this.app.workspace.openLinkText(node.name, "", false);
 					return;
 				}
 				const file = this.fileFor(node);
 				if (!file) return;
-				const leaf = newTab
-					? this.app.workspace.getLeaf("tab")
-					: this.isLocalGraph
-					? this.app.workspace.getLeaf(false)
-					: this.leaf;
+				const leaf = this.isLocalGraph ? this.app.workspace.getLeaf(false) : this.leaf;
 				leaf.openFile(file);
 			})
 			.onNodeRightClick((node: Node, event: MouseEvent) => {
+				// as with clicks, a modifier acts as if no node were there
+				if (isModified(event)) return;
 				const menu = new Menu();
 				menu.addItem((item) =>
 					item
