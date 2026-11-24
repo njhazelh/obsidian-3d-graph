@@ -48,9 +48,10 @@ const WARMUP_NODE_TICKS = 150_000; // node × tick budget for the warm-up
 const MIN_WARMUP_TICKS = 20;
 const warmupTicks = (nodes: number) =>
 	Math.max(MIN_WARMUP_TICKS, Math.min(WARMUP_TICKS, Math.round(WARMUP_NODE_TICKS / Math.max(1, nodes))));
-// Motes are moved on the CPU every frame; past this many in total, each
-// link gets fewer
-const MOTE_BUDGET = 60_000;
+// Motes are moved on the CPU every frame (about 60 ns each); past this many
+// in total, each link gets fewer. On an 18k-link vault: 9 per link at ~57 fps
+// (60k gave 3 per link at 60 fps; 250k, 13 per link at ~49 fps)
+const MOTE_BUDGET = 180_000;
 // segments around each node sphere; small spheres on a big graph don't need many
 const nodeResolution = (nodes: number) => (nodes > 2000 ? 8 : nodes > 500 ? 12 : 20);
 const COOLDOWN_MS = 2500;
