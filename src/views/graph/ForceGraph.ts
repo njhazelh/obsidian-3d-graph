@@ -82,6 +82,20 @@ const LABEL_SCALE = 1.1;
 const LABEL_FADE_RADII = 3.2;
 // labels shorter than this on screen, in pixels, aren't drawn
 const MIN_LABEL_PX = 6;
+// wheel zoom: the change in camera distance per pixel of scrolling (about
+// the orbit controls' 5% per notch of 100 px)
+const ZOOM_PER_PIXEL = 0.0005;
+
+// the parts of three's OrbitControls the wheel zoom uses
+interface OrbitControlsLike {
+	target: THREE.Vector3;
+	enabled?: boolean;
+	enableZoom?: boolean;
+	zoomSpeed?: number;
+	minDistance?: number;
+	maxDistance?: number;
+	update(): void;
+}
 
 type Positioned = Node & { x?: number; y?: number; z?: number };
 
@@ -171,6 +185,9 @@ export class ForceGraph {
 
 		const trackMouse = (event: MouseEvent) => (this.lastMouseEvent = event);
 		this.rootHtmlElement.addEventListener("mousemove", trackMouse);
+		// zoom toward the cursor; caught on the way down to the canvas, so the
+		// orbit controls' own wheel zoom (toward the center) never sees it
+		this.rootHtmlElement.addEventListener("wheel", this.onWheel, { capture: true, passive: false });
 
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const controls = this.instance.controls() as any;
@@ -187,6 +204,7 @@ export class ForceGraph {
 			EventBus.off("theme-changed", this.onThemeChanged);
 			EventBus.off("core-graph-options-changed", this.onCoreOptionsChanged);
 			this.rootHtmlElement.removeEventListener("mousemove", trackMouse);
+			this.rootHtmlElement.removeEventListener("wheel", this.onWheel, { capture: true });
 			controls?.removeEventListener?.("change", this.updateLabelFade);
 			controls?.removeEventListener?.("start", onUserCamera);
 			resizeObserver.disconnect();
@@ -525,6 +543,69 @@ export class ForceGraph {
 		this.fitCamera(0);
 		if (this.layoutSettled) this.hasFramedGraph = true;
 	};
+
+	// Zooms toward the point under the cursor, like the 2D graph, instead of
+	// toward the center of the view: the hovered node, or where the cursor's
+	// ray crosses the plane through the orbit center facing the camera.
+	// Moving the camera and the orbit center toward that point by the same
+	// factor keeps it under the cursor.
+	private onWheel = (event: WheelEvent) => {
+		const controls = this.instance.controls() as unknown as OrbitControlsLike | undefined;
+		if (!controls?.target || controls.enabled === false || controls.enableZoom === false) return;
+		const canvas = this.instance.renderer().domElement;
+		const rect = canvas.getBoundingClientRect();
+		if (!rect.width || !rect.height) return;
+		event.preventDefault();
+		event.stopPropagation();
+
+		// lines, pages and pixels; trackpad pinches arrive as wheel events too
+		const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 100 : 1);
+		const camera = this.instance.camera() as unknown as THREE.Object3D;
+		const position = camera.position;
+		const target = controls.target;
+		const distance = position.distanceTo(target);
+		if (!distance) return;
+		const next = Math.min(
+			controls.maxDistance ?? Infinity,
+			Math.max(controls.minDistance ?? 0, distance * Math.exp(delta * ZOOM_PER_PIXEL * (controls.zoomSpeed ?? 1)))
+		);
+		const factor = next / distance;
+		if (factor === 1) return;
+
+		const point = this.zoomPoint(event, rect, camera, target);
+		// p' = point + (p - point) × factor, for the camera and the orbit center
+		position.sub(point).multiplyScalar(factor).add(point);
+		target.sub(point).multiplyScalar(factor).add(point);
+		this.userMovedCamera = true;
+		controls.update(); // tells listeners (label fade) the camera changed
+	};
+
+	private zoomPoint(
+		event: WheelEvent,
+		rect: DOMRect,
+		camera: THREE.Object3D,
+		target: THREE.Vector3
+	): THREE.Vector3 {
+		const hovered = this.hoveredNode as (Node & Positioned) | null;
+		if (hovered && hovered.x !== undefined)
+			return new THREE.Vector3(hovered.x, hovered.y ?? 0, hovered.z ?? 0);
+		const position = camera.position;
+		// the cursor's ray, from normalized device coordinates
+		const ray = new THREE.Vector3(
+			((event.clientX - rect.left) / rect.width) * 2 - 1,
+			-((event.clientY - rect.top) / rect.height) * 2 + 1,
+			0.5
+		)
+			.unproject(camera)
+			.sub(position)
+			.normalize();
+		const toTarget = new THREE.Vector3().copy(target).sub(position);
+		const view = new THREE.Vector3().copy(toTarget).normalize();
+		const along = ray.dot(view);
+		// the ray runs along the plane (can't happen in front of the camera)
+		if (along <= 1e-6) return new THREE.Vector3().copy(target);
+		return ray.multiplyScalar(toTarget.dot(view) / along).add(position);
+	}
 
 	// ====================== Data and filters ====================== //
 
