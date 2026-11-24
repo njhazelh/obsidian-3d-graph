@@ -13,6 +13,7 @@ import ObsidianTheme from "../../util/ObsidianTheme";
 import { compileQuery, isEmptyQuery, Matcher, unsupportedSyntax } from "../../graph/Search";
 import { clusterColor, clusterInto } from "../../graph/Clusters";
 import { brokenLinkKey } from "../../settings/categories/FilterSettings";
+import { MoteField, MoteStyle } from "./MoteField";
 
 // a cluster needs at least this many notes to get a color
 const MIN_CLUSTER_SIZE = 2;
@@ -39,6 +40,17 @@ const pushTo = <K, V>(map: Map<K, V[]>, key: K, value: V) => {
 const TAG_PAIR_LIMIT = 30;
 
 const WARMUP_TICKS = 120;
+const COOLDOWN_MS = 2500;
+
+// The load bounce, like the 2D graph: the settled layout grows out of its
+// center on a damped spring, past full size and back (seconds, fractions)
+const BOUNCE_START = 0.1; // starting size
+const BOUNCE_SECONDS = 1.5;
+const BOUNCE_DAMPING = 3; // higher settles faster
+const BOUNCE_FREQUENCY = 5.2; // radians per second
+
+// a node pinned in place by the layout (d3's fixed positions)
+type PinnedNode = { fx?: number; fy?: number; fz?: number };
 
 type Coords = { x: number; y: number; z: number };
 
@@ -83,10 +95,25 @@ export class ForceGraph {
 
 	private readonly labels = new Map<string, THREE.Sprite>();
 	private readonly labelFade = new Map<string, number>();
+	// framing: while a new layout settles the camera keeps the whole graph in
+	// view, until the layout stops (then one final fit) or the user moves it
 	private hasFramedGraph = false;
+	private layoutSettled = false;
+	private userMovedCamera = false;
+	// spring the graph out from its center once it's first on screen
+	private pendingBounce = true;
+	private bounce: {
+		elapsed: number; // seconds of animation shown so far
+		last: number; // time of the last step
+		center: { x: number; y: number; z: number };
+		nodes: { node: Positioned & PinnedNode; x: number; y: number; z: number }[];
+	} | null = null;
 	private filterTimer = 0;
 	private animationTimer = 0;
 	private readonly unsubscribers: (() => void)[] = [];
+	private motes: MoteField | null = null;
+	private moteFrame = 0;
+	private lastFrameTime = 0;
 
 	constructor(
 		plugin: Graph3dPlugin,
@@ -98,6 +125,7 @@ export class ForceGraph {
 		this.plugin = plugin;
 
 		this.createGraph();
+		this.startMotes();
 		// after the graph: the renderer clears its container when it starts
 		this.legendEl = this.rootHtmlElement.createDiv({ cls: "graph-3d-cluster-legend" });
 		this.initListeners();
@@ -122,6 +150,12 @@ export class ForceGraph {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const controls = this.instance.controls() as any;
 		controls?.addEventListener?.("change", this.updateLabelFade);
+		// the user took the camera: stop fitting the graph for them
+		const onUserCamera = () => (this.userMovedCamera = true);
+		controls?.addEventListener?.("start", onUserCamera);
+
+		const resizeObserver = new ResizeObserver(this.onContainerResized);
+		resizeObserver.observe(this.rootHtmlElement);
 
 		this.unsubscribers.push(() => {
 			EventBus.off("graph-changed", this.onVaultGraphChanged);
@@ -129,6 +163,8 @@ export class ForceGraph {
 			EventBus.off("core-graph-options-changed", this.onCoreOptionsChanged);
 			this.rootHtmlElement.removeEventListener("mousemove", trackMouse);
 			controls?.removeEventListener?.("change", this.updateLabelFade);
+			controls?.removeEventListener?.("start", onUserCamera);
+			resizeObserver.disconnect();
 			window.clearTimeout(this.filterTimer);
 			window.clearTimeout(this.animationTimer);
 		});
@@ -138,6 +174,8 @@ export class ForceGraph {
 	public destroy() {
 		this.unsubscribers.forEach((unsubscribe) => unsubscribe());
 		this.unsubscribers.length = 0;
+		window.cancelAnimationFrame(this.moteFrame);
+		this.motes?.dispose();
 		this.legendEl?.remove();
 		this.instance._destructor();
 	}
@@ -175,8 +213,8 @@ export class ForceGraph {
 			.height(this.rootHtmlElement.offsetHeight || window.innerHeight)
 			// settle most of the layout before the first frame, then frame it
 			.warmupTicks(WARMUP_TICKS)
-			.cooldownTime(2500)
-			.onEngineTick(this.updateLabelFade)
+			.cooldownTime(COOLDOWN_MS)
+			.onEngineTick(this.onEngineTick)
 			.onEngineStop(this.frameGraph)
 			.graphData(this.getGraphData());
 	}
@@ -219,12 +257,210 @@ export class ForceGraph {
 		if (reheat) this.instance.d3ReheatSimulation();
 	}
 
-	// Zoom to fit the whole graph once its layout settles
+	private get hasSize() {
+		return this.rootHtmlElement.offsetWidth > 0 && this.rootHtmlElement.offsetHeight > 0;
+	}
+
+	// Moves the camera, keeping its viewing direction, to the closest point
+	// from which every node (or those passing `include`) is in view, with a
+	// margin for labels. Unlike zoomToFit, which sizes the view for the
+	// graph's largest extent in any direction (depth included) and ignores
+	// the view's shape, this measures the graph as the camera sees it, so the
+	// graph fills the screen.
+	private fitCamera(ms: number, include: (node: Node) => boolean = () => true) {
+		// during the load bounce the nodes are pinned to a shrunken copy of the
+		// layout; fit the settled layout the bounce grows into
+		const settled = new Map<Node, { x: number; y: number; z: number }>(
+			(this.bounce?.nodes ?? []).map((b) => [b.node, b])
+		);
+		const nodes = (this.instance.graphData().nodes as Positioned[])
+			.filter((n) => n.x !== undefined && include(n))
+			.map((n) => {
+				const at = settled.get(n);
+				return at ? { node: n, x: at.x, y: at.y, z: at.z } : { node: n, x: n.x, y: n.y, z: n.z };
+			});
+		const { offsetWidth: width, offsetHeight: height } = this.rootHtmlElement;
+		if (nodes.length === 0 || !width || !height) return;
+
+		// center of the nodes' bounding box
+		const lo = [Infinity, Infinity, Infinity];
+		const hi = [-Infinity, -Infinity, -Infinity];
+		nodes.forEach((n) =>
+			[n.x ?? 0, n.y ?? 0, n.z ?? 0].forEach((v, k) => {
+				lo[k] = Math.min(lo[k], v);
+				hi[k] = Math.max(hi[k], v);
+			})
+		);
+		const c = lo.map((v, k) => (v + hi[k]) / 2);
+
+		// the camera's axes once it looks at the center: back (center ->
+		// camera), right and up, derived from camera.up as camera.lookAt does
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const camera = this.instance.camera() as any;
+		const pos = camera.position;
+		const normalize = (a: number[]) => {
+			const l = Math.hypot(a[0], a[1], a[2]);
+			return l > 0 ? a.map((v) => v / l) : a;
+		};
+		const cross = (a: number[], b: number[]) => [
+			a[1] * b[2] - a[2] * b[1],
+			a[2] * b[0] - a[0] * b[2],
+			a[0] * b[1] - a[1] * b[0],
+		];
+		let back = [pos.x - c[0], pos.y - c[1], pos.z - c[2]];
+		back = Math.hypot(back[0], back[1], back[2]) > 1e-6 ? normalize(back) : [0, 0, 1];
+		const camUp = normalize(camera.up ? [camera.up.x, camera.up.y, camera.up.z] : [0, 1, 0]);
+		let right = cross(camUp, back);
+		if (Math.hypot(right[0], right[1], right[2]) < 1e-9) {
+			// looking straight along camera.up: nudge the view as
+			// Matrix4.lookAt does, so the fit matches the camera's orientation
+			const nudged = back.slice();
+			if (Math.abs(camUp[2]) === 1) nudged[0] += 0.0001;
+			else nudged[2] += 0.0001;
+			right = cross(camUp, normalize(nudged));
+		}
+		right = normalize(right);
+		const up = cross(back, right);
+		const dot = (a: number[], b: number[]) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+		// view half-angles, less a margin of the view on each side
+		const margin = Math.min(width, height) * 0.05 + 12;
+		const tanHalfFov = Math.tan((((camera.fov as number) ?? 40) * Math.PI) / 360);
+		const tanV = tanHalfFov * Math.max(0.2, 1 - (2 * margin) / height);
+		const tanH = tanHalfFov * (width / height) * Math.max(0.2, 1 - (2 * margin) / width);
+		// labels hang below the node
+		const below = this.display.showLabels ? this.display.nodeSize * LABEL_SCALE + 2 : 0;
+
+		// closest camera distance from which each node fits, sideways and
+		// vertically (a node nearer the camera needs more room)
+		let distance = 0;
+		nodes.forEach((n) => {
+			const q = [(n.x ?? 0) - c[0], (n.y ?? 0) - c[1], (n.z ?? 0) - c[2]];
+			const r = this.nodeRadius(n.node) * 1.3;
+			const depth = dot(q, back);
+			distance = Math.max(
+				distance,
+				depth + (Math.abs(dot(q, right)) + r) / tanH,
+				depth + (Math.abs(dot(q, up)) + r + below) / tanV
+			);
+		});
+		distance = Math.max(distance, 40);
+		this.instance.cameraPosition(
+			{ x: c[0] + back[0] * distance, y: c[1] + back[1] * distance, z: c[2] + back[2] * distance },
+			{ x: c[0], y: c[1], z: c[2] },
+			ms
+		);
+	}
+
+	// Frames the settled layout, then grows it out of its center on a damped
+	// spring, past full size and back, like the 2D graph on load. Nodes are
+	// pinned along the way, then released into the live layout. Returns
+	// false if there's no layout to bounce yet.
+	private startBounce(): boolean {
+		const nodes = (this.instance.graphData().nodes as (Positioned & PinnedNode)[]).filter(
+			(n) => n.x !== undefined
+		);
+		if (nodes.length === 0) return false;
+		this.pendingBounce = false;
+		if (nodes.length < 2) return false;
+		// the camera stays put; the graph grows to fill it
+		this.fitCamera(0);
+		const center = { x: 0, y: 0, z: 0 };
+		nodes.forEach((n) => {
+			center.x += (n.x ?? 0) / nodes.length;
+			center.y += (n.y ?? 0) / nodes.length;
+			center.z += (n.z ?? 0) / nodes.length;
+		});
+		this.bounce = {
+			elapsed: 0,
+			last: performance.now(),
+			center,
+			nodes: nodes.map((node) => ({ node, x: node.x ?? 0, y: node.y ?? 0, z: node.z ?? 0 })),
+		};
+		this.stepBounce();
+		// keep the layout engine running so the pinned positions are drawn,
+		// however slow the frames (the usual cooldown is restored after)
+		this.instance.cooldownTime(Infinity).d3ReheatSimulation();
+		return true;
+	}
+
+	// Moves the pinned nodes along the spring; ends the bounce when it's done
+	private stepBounce() {
+		const bounce = this.bounce;
+		if (!bounce) return;
+		// advance at most 1/20 s per frame, so a slow first frame (labels are
+		// built at load) doesn't skip the animation
+		const now = performance.now();
+		bounce.elapsed += Math.min(0.05, (now - bounce.last) / 1000);
+		bounce.last = now;
+		const t = bounce.elapsed;
+		if (t >= BOUNCE_SECONDS) {
+			this.endBounce();
+			return;
+		}
+		// 1 - (1 - start) e^(-dt) cos(ft), eased to exactly 1 at the end
+		const scale =
+			1 -
+			(1 - BOUNCE_START) *
+				Math.exp(-BOUNCE_DAMPING * t) *
+				Math.cos(BOUNCE_FREQUENCY * t) *
+				(1 - t / BOUNCE_SECONDS);
+		const c = bounce.center;
+		bounce.nodes.forEach(({ node, x, y, z }) => {
+			node.fx = c.x + (x - c.x) * scale;
+			node.fy = c.y + (y - c.y) * scale;
+			node.fz = c.z + (z - c.z) * scale;
+		});
+	}
+
+	// Releases the nodes at their settled positions
+	private endBounce() {
+		const bounce = this.bounce;
+		if (!bounce) return;
+		this.bounce = null;
+		this.instance.cooldownTime(COOLDOWN_MS);
+		bounce.nodes.forEach(({ node, x, y, z }) => {
+			Object.assign(node, { x, y, z, vx: 0, vy: 0, vz: 0 });
+			delete node.fx;
+			delete node.fy;
+			delete node.fz;
+		});
+	}
+
+	private get shouldFollowLayout() {
+		return !this.hasFramedGraph && !this.userMovedCamera && this.hasSize;
+	}
+
+	// While a new layout settles, keep it all in view
+	private onEngineTick = () => {
+		this.updateLabelFade();
+		if (this.pendingBounce && this.hasSize && this.startBounce()) return;
+		// while bouncing the camera holds still and the graph grows into it
+		if (this.bounce) this.stepBounce();
+		else if (this.shouldFollowLayout) this.fitCamera(0);
+	};
+
+	// The layout stopped: one last, smooth fit. A view hidden while loading
+	// (e.g. a background tab at startup) is framed when it is first shown.
 	private frameGraph = () => {
 		this.updateLabelFade();
-		if (this.hasFramedGraph) return;
+		this.endBounce();
+		this.layoutSettled = true;
+		if (!this.shouldFollowLayout) return;
 		this.hasFramedGraph = true;
-		this.instance.zoomToFit(500, 40);
+		this.fitCamera(400);
+	};
+
+	// the view was resized or shown: match the canvas to it, and frame the
+	// graph if that hasn't happened yet
+	private onContainerResized = () => {
+		if (!this.hasSize) return;
+		this.updateDimensions();
+		// first shown now (hidden while loading): bounce in, like on load
+		if (this.pendingBounce && this.startBounce()) return;
+		if (!this.shouldFollowLayout) return;
+		this.fitCamera(0);
+		if (this.layoutSettled) this.hasFramedGraph = true;
 	};
 
 	// ====================== Data and filters ====================== //
@@ -657,9 +893,11 @@ export class ForceGraph {
 			});
 			item.addEventListener("mouseenter", () => this.highlightCluster(cluster));
 			item.addEventListener("mouseleave", () => this.highlightCluster(null));
-			item.addEventListener("click", () =>
-				this.instance.zoomToFit(600, 60, (n: Node) => cluster.members.has(n.id))
-			);
+			item.addEventListener("click", () => {
+				// the camera is the user's now; don't fit the whole graph over it
+				this.userMovedCamera = true;
+				this.fitCamera(600, (n) => cluster.members.has(n.id));
+			});
 		});
 		const hidden = this.clusters.length - MAX_LEGEND_ITEMS;
 		if (hidden > 0)
@@ -700,6 +938,7 @@ export class ForceGraph {
 	// that were already on screen so the layout doesn't jump
 	private setGraphData(graph: Graph, reframe: boolean) {
 		window.clearTimeout(this.animationTimer);
+		this.endBounce();
 		const previous = new Map<string, Record<string, number>>();
 		this.instance.graphData().nodes.forEach((n: Record<string, unknown>) => {
 			previous.set(n.id as string, n as Record<string, number>);
@@ -714,10 +953,15 @@ export class ForceGraph {
 
 		this.clearHighlights();
 		this.hoveredNode = null;
-		if (reframe) this.hasFramedGraph = false;
+		this.layoutSettled = false;
+		if (reframe) {
+			this.hasFramedGraph = false;
+			this.userMovedCamera = false;
+		}
 		this.instance.graphData(graph);
 		this.applyForces();
 		this.rebuildLabels();
+		this.resetMotes();
 	}
 
 	// the vault changed: rebuild, but keep the camera where it is
@@ -727,6 +971,8 @@ export class ForceGraph {
 
 	// the local graph's file changed: new graph, reframe
 	private onOpenFileChanged = () => {
+		// a new local graph bounces in, like a fresh load
+		this.pendingBounce = true;
 		this.setGraphData(this.getGraphData(), true);
 	};
 
@@ -745,6 +991,8 @@ export class ForceGraph {
 	// 2D graph's "Animate" button
 	public animate() {
 		window.clearTimeout(this.animationTimer);
+		this.pendingBounce = false;
+		this.endBounce();
 		const full = this.graph;
 		const files = full.nodes
 			.filter((n) => n.kind === "note" || n.kind === "attachment")
@@ -783,6 +1031,7 @@ export class ForceGraph {
 						present.has(endpointId(l.target))
 				),
 			});
+			this.resetMotes();
 			if (count < files.length)
 				this.animationTimer = window.setTimeout(step, 60);
 			else {
@@ -833,14 +1082,14 @@ export class ForceGraph {
 			this.rebuildLabels();
 		} else if (path === "display.showLabels" || path === "display.textFade") {
 			this.rebuildLabels();
-		} else if (path === "display.particleSize") {
-			this.instance.linkDirectionalParticleWidth(data.newValue);
 		}
 
+		if (path.startsWith("display.")) this.resetMotes();
 		this.updateHighlight(); // re-evaluate colors, widths and arrows
 	};
 
 	private onThemeChanged = () => {
+		this.resetMotes();
 		this.rebuildLabels();
 		this.updateHighlight();
 	};
@@ -1077,17 +1326,109 @@ export class ForceGraph {
 		return this.highlightedNodes.has(node.id);
 	};
 
+	// ====================== Motes ====================== //
+
+	private get isDarkTheme() {
+		const m = this.theme.backgroundPrimary.match(/\d+(\.\d+)?/g);
+		if (!m) return true;
+		const [r, g, b] = m.map(Number);
+		return 0.299 * r + 0.587 * g + 0.114 * b < 128;
+	}
+
+	private readonly moteStyle: MoteStyle = {
+		count: () => this.display.motesPerLink,
+		colors: (link: Link) => {
+			if (this.isHighlightedLink(link))
+				return [this.theme.interactiveAccentHover, this.theme.textAccent];
+			const node = (end: string | Node) =>
+				typeof end === "string" ? undefined : (end as Node);
+			const s = node(link.source);
+			const t = node(link.target);
+			const fallback = this.theme.textMuted;
+			return [s ? this.moteColor(s) : fallback, t ? this.moteColor(t) : fallback];
+		},
+		brightness: (link: Link) => {
+			const highlighted = this.isHighlightedLink(link);
+			// in lines mode, motes only show on the hovered links
+			if (!this.alwaysParticles) return highlighted ? 1 : 0;
+			if (this.hasHighlight()) return highlighted ? 1 : 0.08;
+			return 0.9;
+		},
+		size: 0,
+		speed: 0,
+		spread: 0,
+		solidity: 0,
+		coalescence: 0,
+		additive: true,
+	};
+
+	// node colors for motes, asked for every frame, so cached until the
+	// graph, settings, theme or highlight change
+	private readonly moteColors = new Map<string, string>();
+	private moteColor(node: Node): string {
+		let color = this.moteColors.get(node.id);
+		if (color === undefined) {
+			color = this.baseColor(node);
+			this.moteColors.set(node.id, color);
+		}
+		return color;
+	}
+
+	private refreshMoteStyle() {
+		this.moteColors.clear();
+		this.moteStyle.size = this.display.particleSize * 4.5;
+		this.moteStyle.speed = this.display.particleSpeed * 0.06;
+		this.moteStyle.spread = this.display.particleArc;
+		this.moteStyle.solidity = this.display.particleSolidity;
+		this.moteStyle.coalescence = this.display.streamCoalescence;
+		// glows add up on dark themes; solid dots should cover what's behind
+		this.moteStyle.additive = this.isDarkTheme && this.display.particleSolidity < 0.5;
+	}
+
+	private startMotes() {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		this.motes = new MoteField(this.instance.scene() as any);
+		this.resetMotes();
+		const frame = (now: number) => {
+			const dt = this.lastFrameTime ? Math.min(0.05, (now - this.lastFrameTime) / 1000) : 0;
+			this.lastFrameTime = now;
+			// nothing to draw while the view is in a background tab or minimized
+			const shown = !document.hidden && this.rootHtmlElement.offsetParent !== null;
+			if (shown)
+				this.motes?.update(dt, this.moteStyle, this.rootHtmlElement.offsetHeight || 600);
+			this.moteFrame = window.requestAnimationFrame(frame);
+		};
+		this.moteFrame = window.requestAnimationFrame(frame);
+	}
+
+	// lay motes out again for the links on screen
+	private resetMotes() {
+		this.refreshMoteStyle();
+		this.motes?.clearColors();
+		this.motes?.setLinks(this.instance.graphData().links as Link[], this.moteStyle);
+	}
+
 	// ====================== Links ====================== //
+
+	private get showLines() {
+		return this.display.linkStyle !== "particles";
+	}
+
+	private get alwaysParticles() {
+		return this.display.linkStyle !== "lines";
+	}
 
 	private createLinks = () => {
 		this.instance
-			.linkWidth((link: Link) =>
-				this.isHighlightedLink(link)
+			.linkWidth((link: Link) => {
+				if (!this.showLines) return 0;
+				return this.isHighlightedLink(link)
 					? this.display.linkThickness * 0.6
-					: this.display.linkThickness * 0.2
-			)
+					: this.display.linkThickness * 0.2;
+			})
 			.linkResolution(8)
 			.linkOpacity(1)
+			// straight links: motes draw their own arcs (see MoteField)
 			.linkDirectionalArrowLength(this.arrowLength)
 			.linkDirectionalArrowRelPos(1)
 			.linkDirectionalArrowColor(this.getArrowColor)
@@ -1096,18 +1437,14 @@ export class ForceGraph {
 			.linkThreeObjectExtend(true)
 			.linkThreeObject(this.createReverseArrow)
 			.linkPositionUpdate(this.updateReverseArrow)
-			// particles flow along the hovered links
-			.linkDirectionalParticles((link: Link) =>
-				this.isHighlightedLink(link) ? this.display.particleCount : 0
-			)
-			.linkDirectionalParticleWidth(this.display.particleSize)
-			.linkDirectionalParticleColor(() => this.theme.textAccent)
+			.linkDirectionalParticles(0)
 			.onLinkHover(this.onLinkHover)
 			.linkColor(this.getLinkColor);
 	};
 
 	private getLinkColor = (link: Link): string => {
 		const theme = this.theme;
+		if (!this.showLines) return "rgba(0, 0, 0, 0)";
 		if (this.isHighlightedLink(link))
 			return ObsidianTheme.withAlpha(theme.textAccent, 0.9);
 		return ObsidianTheme.withAlpha(
@@ -1175,7 +1512,7 @@ export class ForceGraph {
 	};
 
 	private onLinkHover = (link: Link | null) => {
-		if (this.hoveredNode) return; // nodes take precedence
+		if (this.hoveredNode || !this.showLines) return; // nodes take precedence
 		this.clearHighlights();
 
 		if (link) {
@@ -1192,6 +1529,7 @@ export class ForceGraph {
 	};
 
 	private updateHighlight() {
+		this.moteColors.clear();
 		this.labels.forEach((sprite, id) => this.applyLabelHighlight(id, sprite));
 		// re-setting the accessors makes three-forcegraph re-evaluate them
 		// (re-setting linkThreeObject rebuilds the reverse arrows, so they pick
@@ -1203,7 +1541,7 @@ export class ForceGraph {
 			.linkWidth(this.instance.linkWidth())
 			.linkDirectionalArrowLength(this.instance.linkDirectionalArrowLength())
 			.linkDirectionalArrowColor(this.instance.linkDirectionalArrowColor())
-			.linkDirectionalParticles(this.instance.linkDirectionalParticles());
+			;
 	}
 
 	getInstance(): ForceGraph3DInstance {
