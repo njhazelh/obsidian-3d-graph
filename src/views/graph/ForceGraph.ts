@@ -40,7 +40,21 @@ const pushTo = <K, V>(map: Map<K, V[]>, key: K, value: V) => {
 const TAG_PAIR_LIMIT = 30;
 
 const WARMUP_TICKS = 120;
+// The warm-up runs before the first frame and blocks the window, and a tick
+// costs about one node-repulsion pass, so big graphs get fewer warm-up ticks
+// and settle the rest on screen
+const WARMUP_NODE_TICKS = 150_000; // node × tick budget for the warm-up
+const MIN_WARMUP_TICKS = 20;
+const warmupTicks = (nodes: number) =>
+	Math.max(MIN_WARMUP_TICKS, Math.min(WARMUP_TICKS, Math.round(WARMUP_NODE_TICKS / Math.max(1, nodes))));
+// Motes are moved on the CPU every frame; past this many in total, each
+// link gets fewer
+const MOTE_BUDGET = 60_000;
+// segments around each node sphere; small spheres on a big graph don't need many
+const nodeResolution = (nodes: number) => (nodes > 2000 ? 8 : nodes > 500 ? 12 : 20);
 const COOLDOWN_MS = 2500;
+// a graph with a shorter warm-up gets longer on screen to settle
+const MAX_COOLDOWN_MS = 8000;
 
 // The load bounce, like the 2D graph: the settled layout grows out of its
 // center on a damped spring, past full size and back (seconds, fractions)
@@ -113,7 +127,10 @@ export class ForceGraph {
 	private readonly unsubscribers: (() => void)[] = [];
 	private motes: MoteField | null = null;
 	private moteFrame = 0;
+	// settings the motes read for every link, refreshed once per frame
+	private readonly moteFrameState = { always: true, highlight: false };
 	private lastFrameTime = 0;
+	private cooldownMs = COOLDOWN_MS;
 
 	constructor(
 		plugin: Graph3dPlugin,
@@ -211,12 +228,22 @@ export class ForceGraph {
 			.showNavInfo(false)
 			.width(this.rootHtmlElement.offsetWidth || window.innerWidth)
 			.height(this.rootHtmlElement.offsetHeight || window.innerHeight)
-			// settle most of the layout before the first frame, then frame it
-			.warmupTicks(WARMUP_TICKS)
-			.cooldownTime(COOLDOWN_MS)
 			.onEngineTick(this.onEngineTick)
-			.onEngineStop(this.frameGraph)
-			.graphData(this.getGraphData());
+			.onEngineStop(this.frameGraph);
+		const data = this.getGraphData();
+		// settle most of the layout before the first frame, then frame it
+		this.scaleToGraph(data.nodes.length);
+		this.instance.graphData(data);
+	}
+
+	// Sizes the blocking warm-up, the on-screen cool-down and the node
+	// spheres' detail to the graph
+	private scaleToGraph(nodes: number) {
+		const ticks = warmupTicks(nodes);
+		this.cooldownMs = Math.min(MAX_COOLDOWN_MS, (COOLDOWN_MS * WARMUP_TICKS) / ticks);
+		this.instance.warmupTicks(ticks).cooldownTime(this.cooldownMs);
+		const resolution = nodeResolution(nodes);
+		if (this.instance.nodeResolution() !== resolution) this.instance.nodeResolution(resolution);
 	}
 
 	// ====================== Forces ====================== //
@@ -419,7 +446,7 @@ export class ForceGraph {
 		const bounce = this.bounce;
 		if (!bounce) return;
 		this.bounce = null;
-		this.instance.cooldownTime(COOLDOWN_MS);
+		this.instance.cooldownTime(this.cooldownMs);
 		bounce.nodes.forEach(({ node, x, y, z }) => {
 			Object.assign(node, { x, y, z, vx: 0, vy: 0, vz: 0 });
 			delete node.fx;
@@ -959,6 +986,7 @@ export class ForceGraph {
 			this.hasFramedGraph = false;
 			this.userMovedCamera = false;
 		}
+		this.scaleToGraph(graph.nodes.length);
 		this.instance.graphData(graph);
 		this.applyForces();
 		this.rebuildLabels();
@@ -1036,7 +1064,7 @@ export class ForceGraph {
 			if (count < files.length)
 				this.animationTimer = window.setTimeout(step, 60);
 			else {
-				this.instance.warmupTicks(WARMUP_TICKS);
+				this.scaleToGraph(full.nodes.length);
 				this.rebuildLabels();
 			}
 		};
@@ -1083,6 +1111,8 @@ export class ForceGraph {
 			this.rebuildLabels();
 		} else if (path === "display.showLabels" || path === "display.textFade") {
 			this.rebuildLabels();
+		} else if (path === "display.linkStyle" || path === "display.showArrows") {
+			this.instance.linkVisibility(this.instance.linkVisibility());
 		}
 
 		if (path.startsWith("display.")) this.resetMotes();
@@ -1123,7 +1153,7 @@ export class ForceGraph {
 		this.instance
 			.nodeRelSize(this.display.nodeSize)
 			.nodeVal(this.nodeVal)
-			.nodeResolution(20)
+			.nodeResolution(nodeResolution(this.graph?.nodes.length ?? 0))
 			.nodeOpacity(1)
 			.nodeColor(this.getNodeColor)
 			.nodeLabel((node: Node) =>
@@ -1337,7 +1367,12 @@ export class ForceGraph {
 	}
 
 	private readonly moteStyle: MoteStyle = {
-		count: () => this.display.motesPerLink,
+		// on big graphs each link gets fewer motes, so the total stays bounded
+		count: () =>
+			Math.min(
+				this.display.motesPerLink,
+				Math.max(1, Math.floor(MOTE_BUDGET / Math.max(1, this.graph.links.length)))
+			),
 		colors: (link: Link) => {
 			if (this.isHighlightedLink(link))
 				return [this.theme.interactiveAccentHover, this.theme.textAccent];
@@ -1348,11 +1383,13 @@ export class ForceGraph {
 			const fallback = this.theme.textMuted;
 			return [s ? this.moteColor(s) : fallback, t ? this.moteColor(t) : fallback];
 		},
+		// asked for every link every frame: reads the settings once per
+		// frame (see startMotes)
 		brightness: (link: Link) => {
-			const highlighted = this.isHighlightedLink(link);
+			const frame = this.moteFrameState;
 			// in lines mode, motes only show on the hovered links
-			if (!this.alwaysParticles) return highlighted ? 1 : 0;
-			if (this.hasHighlight()) return highlighted ? 1 : 0.08;
+			if (!frame.always) return frame.highlight && this.isHighlightedLink(link) ? 1 : 0;
+			if (frame.highlight) return this.isHighlightedLink(link) ? 1 : 0.08;
 			return 0.9;
 		},
 		size: 0,
@@ -1395,8 +1432,11 @@ export class ForceGraph {
 			this.lastFrameTime = now;
 			// nothing to draw while the view is in a background tab or minimized
 			const shown = !document.hidden && this.rootHtmlElement.offsetParent !== null;
-			if (shown)
+			if (shown) {
+				this.moteFrameState.always = this.alwaysParticles;
+				this.moteFrameState.highlight = this.hasHighlight();
 				this.motes?.update(dt, this.moteStyle, this.rootHtmlElement.offsetHeight || 600);
+			}
 			this.moteFrame = window.requestAnimationFrame(frame);
 		};
 		this.moteFrame = window.requestAnimationFrame(frame);
@@ -1439,6 +1479,9 @@ export class ForceGraph {
 			.linkThreeObject(this.createReverseArrow)
 			.linkPositionUpdate(this.updateReverseArrow)
 			.linkDirectionalParticles(0)
+			// in particles mode without arrows the link objects would only be
+			// drawn invisibly, one draw call each; don't make them at all
+			.linkVisibility(() => this.showLines || this.showArrows)
 			.onLinkHover(this.onLinkHover)
 			.linkColor(this.getLinkColor);
 	};

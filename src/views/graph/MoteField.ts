@@ -85,6 +85,8 @@ interface Mote {
 	phase: number;
 	speed: number;
 	angle: number;
+	cos: number; // cos and sin of angle
+	sin: number;
 	bow: number; // 0..1, scaled by spread
 	minBow: number; // least bow as a fraction of the link length, whatever the spread
 	reverse: boolean; // flows target -> source (half the lines of a two-way link)
@@ -172,6 +174,8 @@ export class MoteField {
 					phase: line.offset + (slot + (r("j") - 0.5) * 0.15) / perLine[i % lineCount],
 					speed: line.speed,
 					angle: line.angle,
+					cos: Math.cos(line.angle),
+					sin: Math.sin(line.angle),
 					bow: line.bow,
 					// keeps the streams apart even with a small spread
 					minBow: line.bow * sep * 0.12,
@@ -244,77 +248,80 @@ export class MoteField {
 		const alpha = this.geometry.attributes.aAlpha.array as Float32Array;
 		const size = this.geometry.attributes.aSize.array as Float32Array;
 
-		// per-link geometry and colors, computed once per frame; links with
-		// no visible motes (e.g. lines mode with nothing hovered) are skipped
-		let anyVisible = false;
-		const frames = this.links.map((link) => {
-			const bright = style.brightness(link);
-			if (bright <= 0) return null;
-			const s = link.source as Endpoint;
-			const t = link.target as Endpoint;
-			if (typeof s === "string" || typeof t === "string" || s.x === undefined || t.x === undefined)
-				return null;
-			const a = [s.x ?? 0, s.y ?? 0, s.z ?? 0];
-			const b = [t.x ?? 0, t.y ?? 0, t.z ?? 0];
-			const d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-			const len = Math.hypot(d[0], d[1], d[2]) || 1;
-			const u = [d[0] / len, d[1] / len, d[2] / len];
-			// two unit vectors perpendicular to the link
-			const ref = Math.abs(u[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
-			let v = [u[1] * ref[2] - u[2] * ref[1], u[2] * ref[0] - u[0] * ref[2], u[0] * ref[1] - u[1] * ref[0]];
-			const vl = Math.hypot(v[0], v[1], v[2]) || 1;
-			v = [v[0] / vl, v[1] / vl, v[2] / vl];
-			const w = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
-			const [from, to] = style.colors(link);
-			anyVisible = true;
-			return { a, b, len, v, w, from: this.color(from), to: this.color(to), bright };
-		});
-		// all hidden, and already cleared last frame: nothing to do
-		if (!anyVisible && this.cleared) return;
-		this.cleared = !anyVisible;
-
 		// only the visible links' motes are written, packed at the start of
 		// the buffers, and only those are uploaded and drawn: hovering one
-		// link in lines mode costs that link's motes, not the whole vault's
+		// link in lines mode costs that link's motes, not the whole vault's.
+		// Runs for every mote every frame, so it sticks to plain numbers.
+		const speed = this.time * style.speed;
+		const flicker = 0.25 * (1 - style.solidity);
+		const twinkleTime = this.time * 3;
 		let i = 0;
-		const write = (m: Mote, f: NonNullable<(typeof frames)[number]>) => {
-			const o = i * 3;
-			const progress = (((m.phase + this.time * style.speed * m.speed) % 1) + 1) % 1;
-			// position along the arc, source (0) to target (1); color follows
-			// it, so a reversed mote starts in the target's color
-			const t = m.reverse ? 1 - progress : progress;
-			const bow = Math.max(m.bow * style.spread, m.minBow) * f.len;
-			const cos = Math.cos(m.angle) * bow;
-			const sin = Math.sin(m.angle) * bow;
-			// control point: the midpoint pushed out around the link
-			const c = [
-				(f.a[0] + f.b[0]) / 2 + f.v[0] * cos + f.w[0] * sin,
-				(f.a[1] + f.b[1]) / 2 + f.v[1] * cos + f.w[1] * sin,
-				(f.a[2] + f.b[2]) / 2 + f.v[2] * cos + f.w[2] * sin,
-			];
-			const k0 = (1 - t) * (1 - t);
-			const k1 = 2 * (1 - t) * t;
-			const k2 = t * t;
-			pos[o] = k0 * f.a[0] + k1 * c[0] + k2 * f.b[0];
-			pos[o + 1] = k0 * f.a[1] + k1 * c[1] + k2 * f.b[1];
-			pos[o + 2] = k0 * f.a[2] + k1 * c[2] + k2 * f.b[2];
+		for (let link = 0; link < this.links.length; link++) {
+			const first = this.linkStart[link];
+			const last = this.linkStart[link + 1];
+			if (first === last) continue;
+			const l = this.links[link];
+			const bright = style.brightness(l);
+			if (bright <= 0) continue;
+			const s = l.source as Endpoint;
+			const t = l.target as Endpoint;
+			if (typeof s === "string" || typeof t === "string" || s.x === undefined || t.x === undefined)
+				continue;
+			const ax = s.x ?? 0, ay = s.y ?? 0, az = s.z ?? 0;
+			const bx = t.x ?? 0, by = t.y ?? 0, bz = t.z ?? 0;
+			const dx = bx - ax, dy = by - ay, dz = bz - az;
+			const len = Math.hypot(dx, dy, dz) || 1;
+			const ux = dx / len, uy = dy / len, uz = dz / len;
+			// two unit vectors perpendicular to the link
+			const upRef = Math.abs(uy) < 0.9;
+			const rx = upRef ? 0 : 1, ry = upRef ? 1 : 0, rz = 0;
+			let vx = uy * rz - uz * ry, vy = uz * rx - ux * rz, vz = ux * ry - uy * rx;
+			const vl = Math.hypot(vx, vy, vz) || 1;
+			vx /= vl;
+			vy /= vl;
+			vz /= vl;
+			const wx = uy * vz - uz * vy, wy = uz * vx - ux * vz, wz = ux * vy - uy * vx;
+			const mx = (ax + bx) / 2, my = (ay + by) / 2, mz = (az + bz) / 2;
+			const [fromCss, toCss] = style.colors(l);
+			const from = this.color(fromCss);
+			const to = this.color(toCss);
 
-			col[o] = f.from.r + (f.to.r - f.from.r) * t;
-			col[o + 1] = f.from.g + (f.to.g - f.from.g) * t;
-			col[o + 2] = f.from.b + (f.to.b - f.from.b) * t;
+			for (let k = first; k < last; k++) {
+				const m = this.motes[k];
+				const o = i * 3;
+				const progress = (((m.phase + speed * m.speed) % 1) + 1) % 1;
+				// position along the arc, source (0) to target (1); color follows
+				// it, so a reversed mote starts in the target's color
+				const p = m.reverse ? 1 - progress : progress;
+				const bow = Math.max(m.bow * style.spread, m.minBow) * len;
+				const cos = m.cos * bow;
+				const sin = m.sin * bow;
+				// control point: the midpoint pushed out around the link
+				const cx = mx + vx * cos + wx * sin;
+				const cy = my + vy * cos + wy * sin;
+				const cz = mz + vz * cos + wz * sin;
+				const k0 = (1 - p) * (1 - p);
+				const k1 = 2 * (1 - p) * p;
+				const k2 = p * p;
+				pos[o] = k0 * ax + k1 * cx + k2 * bx;
+				pos[o + 1] = k0 * ay + k1 * cy + k2 * by;
+				pos[o + 2] = k0 * az + k1 * cz + k2 * bz;
 
-			// fade in at the source, out at the target, with a gentle twinkle
-			// solid dots hold steady; soft motes twinkle
-			const twinkle = 1 - 0.25 * (1 - style.solidity) * (1 - Math.sin(this.time * 3 + m.twinkle));
-			alpha[i] = Math.sin(Math.PI * t) * twinkle * f.bright;
-			size[i] = style.size * m.size;
-			i++;
-		};
-		frames.forEach((f, link) => {
-			if (!f) return;
-			for (let m = this.linkStart[link]; m < this.linkStart[link + 1]; m++)
-				write(this.motes[m], f);
-		});
+				col[o] = from.r + (to.r - from.r) * p;
+				col[o + 1] = from.g + (to.g - from.g) * p;
+				col[o + 2] = from.b + (to.b - from.b) * p;
+
+				// fade in at the source, out at the target; solid dots hold
+				// steady, soft motes twinkle
+				const twinkle = 1 - flicker * (1 - Math.sin(twinkleTime + m.twinkle));
+				alpha[i] = Math.sin(Math.PI * p) * twinkle * bright;
+				size[i] = style.size * m.size;
+				i++;
+			}
+		}
+		// all hidden, and already cleared last frame: nothing to do
+		if (i === 0 && this.cleared) return;
+		this.cleared = i === 0;
 
 		this.geometry.setDrawRange(0, i);
 		// an empty range would upload the whole buffer (WebGL2 reads a zero
