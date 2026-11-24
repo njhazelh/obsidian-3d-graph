@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import Link from "../../graph/Link";
 import Node from "../../graph/Node";
+import { RENDER_LAYER } from "./GraphBatches";
 
 // Motes of light flowing along links, like iron filings tracing the field
 // between two magnetic poles. Each link gets a few field lines: arcs from the
@@ -221,6 +222,7 @@ export class MoteField {
 		this.points = new THREE.Points(geometry, this.material);
 		this.points.frustumCulled = false;
 		this.points.renderOrder = 5;
+		this.points.layers.set(RENDER_LAYER);
 		this.scene.add(this.points);
 	}
 

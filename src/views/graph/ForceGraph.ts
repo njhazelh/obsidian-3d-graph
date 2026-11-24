@@ -14,6 +14,7 @@ import { compileQuery, isEmptyQuery, Matcher, unsupportedSyntax } from "../../gr
 import { clusterColor, clusterInto } from "../../graph/Clusters";
 import { brokenLinkKey } from "../../settings/categories/FilterSettings";
 import { MoteField, MoteStyle } from "./MoteField";
+import { GraphBatches, RENDER_LAYER } from "./GraphBatches";
 
 // a cluster needs at least this many notes to get a color
 const MIN_CLUSTER_SIZE = 2;
@@ -66,7 +67,6 @@ const BOUNCE_FREQUENCY = 5.2; // radians per second
 // a node pinned in place by the layout (d3's fixed positions)
 type PinnedNode = { fx?: number; fy?: number; fz?: number };
 
-type Coords = { x: number; y: number; z: number };
 
 // D3 replaces link source/target ids with the node objects once rendered
 const endpointId = (end: string | Node): string =>
@@ -77,6 +77,8 @@ const LABEL_SCALE = 1.1;
 // labels start fading at this multiple of the graph's radius (text fade = 0),
 // which is about where zoom-to-fit puts the camera
 const LABEL_FADE_RADII = 3.2;
+// labels shorter than this on screen, in pixels, aren't drawn
+const MIN_LABEL_PX = 6;
 
 type Positioned = Node & { x?: number; y?: number; z?: number };
 
@@ -126,6 +128,7 @@ export class ForceGraph {
 	private animationTimer = 0;
 	private readonly unsubscribers: (() => void)[] = [];
 	private motes: MoteField | null = null;
+	private batches: GraphBatches | null = null;
 	private moteFrame = 0;
 	// settings the motes read for every link, refreshed once per frame
 	private readonly moteFrameState = { always: true, highlight: false };
@@ -193,6 +196,8 @@ export class ForceGraph {
 		this.unsubscribers.length = 0;
 		window.cancelAnimationFrame(this.moteFrame);
 		this.motes?.dispose();
+		this.batches?.dispose();
+		this.batches = null;
 		this.legendEl?.remove();
 		this.instance._destructor();
 	}
@@ -218,6 +223,29 @@ export class ForceGraph {
 		this.createNodes();
 		this.createLinks();
 		this.applyForces();
+		this.createBatches();
+	}
+
+	// Draws nodes, links and arrows in a few batches. The library's own
+	// objects stay for hover, click and drag, on a layer the camera skips.
+	private createBatches() {
+		const instance = this.instance;
+		instance.camera().layers.set(RENDER_LAYER);
+		this.batches = new GraphBatches({
+			scene: () => instance.scene(),
+			graphData: () => instance.graphData(),
+			nodeResolution: () => instance.nodeResolution(),
+			linkResolution: () => instance.linkResolution(),
+			beginFrame: this.beginBatchFrame,
+			linkRadius: (link: Link) =>
+				this.isHighlightedLink(link) ? this.batchFrame.highlightRadius : this.batchFrame.normalRadius,
+			arrowLength: () => this.batchFrame.arrowLength,
+			arrowColor: (link: Link) =>
+				this.isHighlightedLink(link) ? this.batchFrame.arrowHighlight : this.batchFrame.arrowNormal,
+			// three-forcegraph ends arrowheads sqrt(val) × nodeRelSize from a
+			// node's center
+			arrowOffset: (node: Node) => Math.sqrt(Math.max(0, this.nodeVal(node))) * this.batchFrame.nodeSize,
+		});
 	}
 
 	private createInstance() {
@@ -1116,13 +1144,13 @@ export class ForceGraph {
 		}
 
 		if (path.startsWith("display.")) this.resetMotes();
-		this.updateHighlight(); // re-evaluate colors, widths and arrows
+		this.updateHighlight(true); // re-evaluate colors, widths and arrows
 	};
 
 	private onThemeChanged = () => {
 		this.resetMotes();
 		this.rebuildLabels();
-		this.updateHighlight();
+		this.updateHighlight(true);
 	};
 
 	public updateDimensions() {
@@ -1255,6 +1283,9 @@ export class ForceGraph {
 		sprite.scale.set((height * canvas.width) / canvas.height, height, 1);
 		sprite.position.set(0, -(this.nodeRadius(node) + height * 0.75), 0);
 		sprite.renderOrder = 10;
+		// drawn on the camera's layer, and still hit-tested with its node on
+		// the library's layer, so hovering or dragging a label is the node
+		sprite.layers.enable(RENDER_LAYER);
 
 		group.add(sprite);
 		this.labels.set(node.id, sprite);
@@ -1293,6 +1324,9 @@ export class ForceGraph {
 		const base =
 			Math.max(150, radius * LABEL_FADE_RADII) * Math.pow(2, this.display.textFade);
 		const byId = new Map(nodes.map((n) => [n.id, n] as [string, Positioned]));
+		// screen pixels per world unit, at distance 1 from the camera
+		const fov = ((this.instance.camera() as unknown as { fov?: number }).fov ?? 50) * (Math.PI / 180);
+		const pxPerUnit = (this.rootHtmlElement.offsetHeight || 600) / (2 * Math.tan(fov / 2));
 
 		this.labels.forEach((sprite, id) => {
 			const n = byId.get(id);
@@ -1309,7 +1343,12 @@ export class ForceGraph {
 				camera.y - (n.y ?? 0),
 				camera.z - (n.z ?? 0)
 			);
-			this.labelFade.set(id, Math.min(1, Math.max(0, (start + range - d) / range)));
+			const distanceFade = (start + range - d) / range;
+			// a label too small to read on screen is skipped (each one drawn
+			// costs a draw call); it fades out between 1.5× and 1× that size
+			const px = sprite.scale.y * pxPerUnit / Math.max(d, 1e-6);
+			const sizeFade = (px - MIN_LABEL_PX) / (MIN_LABEL_PX * 0.5);
+			this.labelFade.set(id, Math.min(1, Math.max(0, Math.min(distanceFade, sizeFade))));
 			this.applyLabelHighlight(id, sprite);
 		});
 	};
@@ -1459,28 +1498,25 @@ export class ForceGraph {
 		return this.display.linkStyle !== "lines";
 	}
 
+	private linkWidthOf = (link: Link): number => {
+		if (!this.showLines) return 0;
+		return this.isHighlightedLink(link)
+			? this.display.linkThickness * 0.6
+			: this.display.linkThickness * 0.2;
+	};
+
 	private createLinks = () => {
 		this.instance
-			.linkWidth((link: Link) => {
-				if (!this.showLines) return 0;
-				return this.isHighlightedLink(link)
-					? this.display.linkThickness * 0.6
-					: this.display.linkThickness * 0.2;
-			})
+			.linkWidth(this.linkWidthOf)
 			.linkResolution(8)
 			.linkOpacity(1)
-			// straight links: motes draw their own arcs (see MoteField)
-			.linkDirectionalArrowLength(this.arrowLength)
-			.linkDirectionalArrowRelPos(1)
-			.linkDirectionalArrowColor(this.getArrowColor)
-			// three-forcegraph draws one arrow per link, toward its target; a
-			// mutual link gets a second arrowhead pointing back at its source
-			.linkThreeObjectExtend(true)
-			.linkThreeObject(this.createReverseArrow)
-			.linkPositionUpdate(this.updateReverseArrow)
+			// straight links: motes draw their own arcs (see MoteField).
+			// Arrowheads are drawn by the batches (see GraphBatches), so the
+			// library makes none
+			.linkDirectionalArrowLength(0)
 			.linkDirectionalParticles(0)
-			// in particles mode without arrows the link objects would only be
-			// drawn invisibly, one draw call each; don't make them at all
+			// in particles mode without arrows there's nothing to hover or
+			// right-click on a link, so don't make link objects at all
 			.linkVisibility(() => this.showLines || this.showArrows)
 			.onLinkHover(this.onLinkHover)
 			.linkColor(this.getLinkColor);
@@ -1497,62 +1533,35 @@ export class ForceGraph {
 		);
 	};
 
-	private getArrowColor = (link: Link): string => {
-		const theme = this.theme;
-		if (this.isHighlightedLink(link)) return theme.textAccent;
-		return ObsidianTheme.mix(
-			theme.textMuted,
-			theme.backgroundPrimary,
-			this.hasHighlight() ? 0.9 : 0.45
-		);
-	};
-
 	private arrowLength = () => (this.showArrows ? 2 + this.display.linkThickness : 0);
 
-	// the same cone three-forcegraph uses for its arrows: base at the origin,
-	// pointing along +z
-	private createReverseArrow = (link: Link): THREE.Object3D => {
-		const length = this.arrowLength();
-		// three-forcegraph treats a falsy object as "no custom object"
-		if (!link.mutual || !length) return null as unknown as THREE.Object3D;
-		const geometry = new THREE.ConeGeometry(length * 0.25, length, 8);
-		geometry.translate(0, length / 2, 0);
-		geometry.rotateX(Math.PI / 2);
-		const material = new THREE.MeshLambertMaterial({
-			color: new THREE.Color(this.getArrowColor(link)),
-			transparent: true,
-		});
-		return new THREE.Mesh(geometry, material);
+	// What the batches ask for every link every frame, worked out once per
+	// frame (see createBatches): link radii, arrowhead length and colors
+	private readonly batchFrame = {
+		normalRadius: 0,
+		highlightRadius: 0,
+		arrowLength: 0,
+		nodeSize: 1,
+		arrowNormal: new THREE.Color(),
+		arrowHighlight: new THREE.Color(),
+		arrowCss: { normal: "", highlight: "" },
 	};
 
-	// place the reverse arrowhead against the source node, mirroring where
-	// three-forcegraph places the forward one against the target
-	private updateReverseArrow = (
-		arrow: THREE.Object3D | undefined,
-		{ start, end }: { start: Coords; end: Coords },
-		link: Link
-	): boolean => {
-		if (!arrow || !link.mutual || typeof link.source !== "object") return false;
-		const length = this.arrowLength();
-		const source = link.source as Node;
-		// three-forcegraph offsets its arrows by sqrt(val) * nodeRelSize
-		const sourceR = Math.sqrt(Math.max(0, this.nodeVal(source))) * this.display.nodeSize;
-		const dx = start.x - end.x;
-		const dy = (start.y || 0) - (end.y || 0);
-		const dz = (start.z || 0) - (end.z || 0);
-		const lineLen = Math.hypot(dx, dy, dz);
-		if (!lineLen) return false;
-		// the point `d` along the line from the target toward the source
-		const along = (d: number): [number, number, number] => [
-			end.x + (dx * d) / lineLen,
-			(end.y || 0) + (dy * d) / lineLen,
-			(end.z || 0) + (dz * d) / lineLen,
-		];
-		arrow.position.set(...along(lineLen - sourceR - length));
-		const head = new THREE.Vector3(...along(lineLen - sourceR));
-		arrow.parent?.localToWorld(head); // lookAt takes world coordinates
-		arrow.lookAt(head);
-		return false; // let three-forcegraph update the line itself
+	private beginBatchFrame = () => {
+		const frame = this.batchFrame;
+		// as three-forcegraph rounds link widths
+		const radius = (width: number) => Math.ceil(width * 10) / 10 / 2;
+		const thickness = this.display.linkThickness;
+		frame.normalRadius = this.showLines ? radius(thickness * 0.2) : 0;
+		frame.highlightRadius = this.showLines ? radius(thickness * 0.6) : 0;
+		frame.arrowLength = this.arrowLength();
+		frame.nodeSize = this.display.nodeSize;
+		const theme = this.theme;
+		const normal = ObsidianTheme.mix(theme.textMuted, theme.backgroundPrimary, this.hasHighlight() ? 0.9 : 0.45);
+		const highlight = theme.textAccent;
+		// parse colors only when they change
+		if (normal !== frame.arrowCss.normal) frame.arrowNormal.setStyle((frame.arrowCss.normal = normal));
+		if (highlight !== frame.arrowCss.highlight) frame.arrowHighlight.setStyle((frame.arrowCss.highlight = highlight));
 	};
 
 	private onLinkHover = (link: Link | null) => {
@@ -1572,20 +1581,16 @@ export class ForceGraph {
 		this.highlightedLinks.clear();
 	};
 
-	private updateHighlight() {
+	// `rebuildLinks` when link sizes may have changed (settings, theme). A
+	// hover only changes colors: the batches draw link widths and arrowheads
+	// themselves, so the library needn't rebuild every link object, which
+	// re-setting linkWidth does.
+	private updateHighlight(rebuildLinks = false) {
 		this.moteColors.clear();
 		this.labels.forEach((sprite, id) => this.applyLabelHighlight(id, sprite));
 		// re-setting the accessors makes three-forcegraph re-evaluate them
-		// (re-setting linkThreeObject rebuilds the reverse arrows, so they pick
-		// up the new color and size)
-		this.instance
-			.linkThreeObject(this.instance.linkThreeObject())
-			.nodeColor(this.instance.nodeColor())
-			.linkColor(this.instance.linkColor())
-			.linkWidth(this.instance.linkWidth())
-			.linkDirectionalArrowLength(this.instance.linkDirectionalArrowLength())
-			.linkDirectionalArrowColor(this.instance.linkDirectionalArrowColor())
-			;
+		if (rebuildLinks) this.instance.linkWidth(this.instance.linkWidth());
+		this.instance.nodeColor(this.instance.nodeColor()).linkColor(this.instance.linkColor());
 	}
 
 	getInstance(): ForceGraph3DInstance {
