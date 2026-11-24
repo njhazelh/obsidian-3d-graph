@@ -76,13 +76,39 @@ export default class Graph {
 		}
 	}
 
-	// Clones the graph
+	// Clones the graph. Copies each node and link once and remaps the
+	// references between them; structuredClone would follow neighbors
+	// recursively and overflow the stack on a graph of a few thousand notes.
 	public clone = (): Graph => {
+		const copy = <T extends object>(o: T, overrides: Partial<T> = {}): T =>
+			Object.assign(Object.create(Object.getPrototypeOf(o)), o, overrides);
+		const nodeCopies = new Map<Node, Node>();
+		const nodes = this.nodes.map((node) => {
+			const clone = copy(node, { neighbors: [], links: [], tags: [...node.tags] });
+			nodeCopies.set(node, clone);
+			return clone;
+		});
+		// D3 may have swapped a link's ids for the node objects
+		const endpoint = (end: unknown) =>
+			end instanceof Object ? nodeCopies.get(end as Node) ?? end : end;
+		const linkCopies = new Map<Link, Link>();
+		const links = this.links.map((link) => {
+			const clone = copy(link, {
+				source: endpoint(link.source),
+				target: endpoint(link.target),
+			} as Partial<Link>);
+			linkCopies.set(link, clone);
+			return clone;
+		});
+		this.nodes.forEach((node, i) => {
+			node.neighbors.forEach((n) => nodes[i].neighbors.push(nodeCopies.get(n) ?? n));
+			node.links.forEach((l) => nodes[i].links.push(linkCopies.get(l) ?? copy(l)));
+		});
 		return new Graph(
-			structuredClone(this.nodes),
-			structuredClone(this.links),
-			structuredClone(this.nodeIndex),
-			structuredClone(this.linkIndex)
+			nodes,
+			links,
+			new Map(this.nodeIndex),
+			new Map([...this.linkIndex].map(([id, targets]) => [id, new Map(targets)]))
 		);
 	};
 

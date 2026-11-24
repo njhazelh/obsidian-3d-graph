@@ -1,4 +1,5 @@
 import { setIcon } from "obsidian";
+import { defineElement } from "../../util/defineElement";
 
 export type HtmlBuilder = (containerEl: HTMLElement) => void;
 
@@ -56,6 +57,4 @@ export class TreeItem extends HTMLDivElement {
 	};
 }
 
-if (typeof customElements.get("tree-item") === "undefined") {
-	customElements.define("tree-item", TreeItem, { extends: "div" });
-}
+defineElement("tree-item", TreeItem, { extends: "div" });

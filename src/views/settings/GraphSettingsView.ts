@@ -9,6 +9,7 @@ import { DisplaySettings } from "../../settings/categories/DisplaySettings";
 import { ExtraButtonComponent } from "obsidian";
 import State, { StateChange } from "../../util/State";
 import EventBus from "../../util/EventBus";
+import { defineElement } from "../../util/defineElement";
 import GroupSettingsView from "./categories/GroupSettingsView";
 import FilterSettingsView from "./categories/FilterSettingsView";
 import GraphSettings from "src/settings/GraphSettings";
@@ -173,8 +174,4 @@ export class GraphSettingsView extends HTMLDivElement {
 	}
 }
 
-if (typeof customElements.get("graph-settings-view") === "undefined") {
-	customElements.define("graph-settings-view", GraphSettingsView, {
-		extends: "div",
-	});
-}
+defineElement("graph-settings-view", GraphSettingsView, { extends: "div" });
