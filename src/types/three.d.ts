@@ -14,6 +14,15 @@ declare module "three" {
 		y: number;
 		z: number;
 		set(x: number, y: number, z: number): this;
+		copy(v: Vector3): this;
+		add(v: Vector3): this;
+		sub(v: Vector3): this;
+		multiplyScalar(s: number): this;
+		normalize(): this;
+		dot(v: Vector3): number;
+		distanceTo(v: Vector3): number;
+		// from normalized device coordinates to world space, through a camera
+		unproject(camera: Object3D): this;
 		applyMatrix4(m: Matrix4): this;
 		fromBufferAttribute(attribute: BufferAttribute, index: number): this;
 		toArray(array: Float32Array | number[], offset?: number): Float32Array | number[];
