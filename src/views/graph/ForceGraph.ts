@@ -550,6 +550,8 @@ export class ForceGraph {
 	// Moving the camera and the orbit center toward that point by the same
 	// factor keeps it under the cursor.
 	private onWheel = (event: WheelEvent) => {
+		// only over the graph itself, not its settings panel or legend
+		if (!this.onGraphSurface(event)) return;
 		const controls = this.instance.controls() as unknown as OrbitControlsLike | undefined;
 		if (!controls?.target || controls.enabled === false || controls.enableZoom === false) return;
 		const canvas = this.instance.renderer().domElement;
@@ -579,6 +581,13 @@ export class ForceGraph {
 		this.userMovedCamera = true;
 		controls.update(); // tells listeners (label fade) the camera changed
 	};
+
+	// The settings panel and the cluster legend share the view's container
+	// with the canvas, so events caught on the container check where they're
+	// headed
+	private onGraphSurface(event: Event): boolean {
+		return event.target === this.instance.renderer().domElement;
+	}
 
 	private zoomPoint(
 		event: WheelEvent,
