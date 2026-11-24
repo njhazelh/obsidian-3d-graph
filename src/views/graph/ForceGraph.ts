@@ -357,6 +357,7 @@ export class ForceGraph {
 	// pinned along the way, then released into the live layout. Returns
 	// false if there's no layout to bounce yet.
 	private startBounce(): boolean {
+		if (!this.instance) return false;
 		const nodes = (this.instance.graphData().nodes as (Positioned & PinnedNode)[]).filter(
 			(n) => n.x !== undefined
 		);
